@@ -63,6 +63,12 @@ static int s_tside = 0;
 static int s_lean_num = 0, s_lean_den = 1;
 static int s_move_p256 = 256;
 
+// Latest accelerometer sample, refreshed by the data-service handler (which
+// keeps the sensor continuously sampling -- far fresher than on-demand peek).
+// Default: top up, so gravity starts pointing down.
+static int s_accel_x = 0;
+static int s_accel_y = -1000;
+
 #if defined(PBL_TOUCH)
 // Touch state: grid cell under the finger, active while a finger is down.
 // Only compiled where the SDK has the TouchService (Pebble Time 2 / Emery).
@@ -261,12 +267,8 @@ static void update_gravity(void) {
     s_move_p256 = 0;  // gravity off: freeze the sand (build mode)
     return;
   }
-  AccelData a;
-  if (accel_service_peek(&a) < 0) {
-    return;  // sensor busy this frame; keep last gravity
-  }
-  int gx = a.x;    // gravity component toward screen-right
-  int gy = -a.y;   // gravity component toward screen-down
+  int gx = s_accel_x;    // gravity component toward screen-right
+  int gy = -s_accel_y;   // gravity component toward screen-down
   int ax = gx < 0 ? -gx : gx;
   int ay = gy < 0 ? -gy : gy;
   int sx = gx > 0 ? 1 : (gx < 0 ? -1 : 0);
@@ -665,8 +667,23 @@ static void window_unload(Window *window) {
   gpath_destroy(s_arrow_right);
 }
 
+// Accel data handler: keep the freshest sample from each batch.
+static void accel_handler(AccelData *data, uint32_t num_samples) {
+  if (num_samples == 0) {
+    return;
+  }
+  AccelData last = data[num_samples - 1];
+  s_accel_x = last.x;
+  s_accel_y = last.y;
+}
+
 static void init(void) {
   set_palette(s_palette);
+
+  // Continuously sample the accelerometer for low-latency tilt response. The
+  // handler keeps the latest reading; update_gravity reads it each frame.
+  accel_data_service_subscribe(2, accel_handler);
+  accel_service_set_sampling_rate(ACCEL_SAMPLING_50HZ);
 
   s_window = window_create();
   window_set_background_color(s_window, GColorBlack);
@@ -694,6 +711,7 @@ static void deinit(void) {
 #if defined(PBL_TOUCH)
   touch_service_unsubscribe();
 #endif
+  accel_data_service_unsubscribe();
   window_destroy(s_window);
 }
 
