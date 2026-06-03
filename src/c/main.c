@@ -53,6 +53,12 @@ typedef struct { uint8_t behavior; uint8_t visual; const char *name; } Material;
 #define G_FULL 1000
 #define G_MIN  120
 
+// Force-field tools (Attract/Repel): a local gravity perturbation centered on
+// the finger that augments tilt gravity during the sim. FIELD_STR (milli-g) at
+// the center > G_FULL so material is pulled hard; falls off to the edge.
+#define FIELD_MAX_R 48
+#define FIELD_STR   3500   // pull at the finger; tapers to 0 at the rim
+
 // --- Timing ------------------------------------------------------------------
 #define FRAME_MS 33                // ~30 fps
 
@@ -81,6 +87,14 @@ static int s_pdx = 1, s_pdy = 0;
 static int s_tside = 0;
 static int s_lean_num = 0, s_lean_den = 1;
 static int s_move_p256 = 256;
+
+// Tilt-gravity vector this frame (screen-space, x right / y down). Force-field
+// tools add a per-cell vector to this. Field params set each frame in sim_step.
+static int  s_grav_x = 0, s_grav_y = 1000;
+static bool s_field_on = false;
+static int  s_field_fx = 0, s_field_fy = 0;   // finger cell
+static int  s_field_sign = -1;                // -1 attract (toward), +1 repel
+static int  s_field_R = 0, s_field_rr = 0;
 
 // Latest accelerometer sample, refreshed by the data-service handler (which
 // keeps the sensor continuously sampling -- far fresher than on-demand peek).
@@ -112,10 +126,10 @@ static Material s_materials[MAX_MATERIALS] = {
 };
 static int s_material_count = 4;       // valid material indices are 1..4
 
-// Tools: how the finger interacts with the canvas (Brush paints the selected
-// material; Eraser removes). A Pusher tool is planned later.
-typedef enum { TOOL_BRUSH, TOOL_ERASER, NUM_TOOLS } Tool;
-static const char *TOOL_NAMES[NUM_TOOLS] = { "Brush", "Eraser" };
+// Tools: how the finger interacts with the canvas. Brush paints the selected
+// material; Eraser removes; Attract/Repel bend gravity locally (sink / source).
+typedef enum { TOOL_BRUSH, TOOL_ERASER, TOOL_ATTRACT, TOOL_REPEL, NUM_TOOLS } Tool;
+static const char *TOOL_NAMES[NUM_TOOLS] = { "Brush", "Eraser", "Attract", "Repel" };
 
 // --- User settings (changed live from the menu) ------------------------------
 static int  s_brush_mat = 1;          // selected material, 1..s_material_count
@@ -181,6 +195,13 @@ static inline int clamp_i(int v, int lo, int hi) {
 
 static inline bool in_bounds(int gx, int gy) {
   return gx >= 0 && gx < GRID_W && gy >= 0 && gy < GRID_H;
+}
+
+// Tiny integer sqrt (inputs are small: distances within the field radius).
+static inline int isqrt_i(int v) {
+  int r = 0;
+  while ((r + 1) * (r + 1) <= v) r++;
+  return r;
 }
 
 // Color a cell from its material's visual. Hash the coordinate into the visual's
@@ -267,51 +288,45 @@ static void paint_brush(int cx, int cy) {
   }
 }
 
-// Read the accelerometer and derive this frame's gravity. Mapping (from the
-// fluid-sim, tested): screen-right = a.x, down = -a.y. The dominant axis is the
-// "forward" fall direction; the smaller component leans the fall toward the tilt
-// (lean probability = minor/major, so the time-averaged flow tracks the exact
-// angle). The in-plane magnitude sets the per-frame move probability, so a
-// shallow tilt creeps, a steep tilt pours, and a flat watch rests.
-static void update_gravity(void) {
-  if (!s_gravity_on) {
-    s_move_p256 = 0;  // gravity off: freeze the sand (build mode)
-    return;
-  }
-  int gx = s_accel_x;    // gravity component toward screen-right
-  int gy = -s_accel_y;   // gravity component toward screen-down
+// One frame's gravity for a cell, reduced from a screen-space vector (x right,
+// y down): a forward cardinal axis, a perpendicular lean toward the smaller
+// component, and a move probability from the magnitude.
+typedef struct {
+  int fdx, fdy, pdx, pdy, tside, lnum, lden, mp;
+} Grav;
+
+// Reduce a gravity vector to a Grav (shared by the global tilt path and the
+// per-cell force-field path). Mapping from the fluid-sim: right = a.x, down=-a.y.
+static void reduce_grav(int gx, int gy, Grav *o) {
   int ax = gx < 0 ? -gx : gx;
   int ay = gy < 0 ? -gy : gy;
   int sx = gx > 0 ? 1 : (gx < 0 ? -1 : 0);
   int sy = gy > 0 ? 1 : (gy < 0 ? -1 : 0);
 
   int major, minor;
-  if (ax >= ay) {
-    // Horizontal dominant: fall sideways, lean up/down toward the tilt.
-    s_fdx = sx; s_fdy = 0;
-    s_pdx = 0;  s_pdy = 1;
-    s_tside = sy;
+  if (ax >= ay) {           // horizontal dominant
+    o->fdx = sx; o->fdy = 0; o->pdx = 0; o->pdy = 1; o->tside = sy;
     major = ax; minor = ay;
-  } else {
-    // Vertical dominant: fall down/up, lean left/right toward the tilt.
-    s_fdx = 0;  s_fdy = sy;
-    s_pdx = 1;  s_pdy = 0;
-    s_tside = sx;
+  } else {                  // vertical dominant
+    o->fdx = 0; o->fdy = sy; o->pdx = 1; o->pdy = 0; o->tside = sx;
     major = ay; minor = ax;
   }
-  s_lean_num = minor;
-  s_lean_den = major > 0 ? major : 1;
+  o->lnum = minor;
+  o->lden = major > 0 ? major : 1;
 
-  // In-plane magnitude ~= |(gx,gy)| via alpha-max-plus-beta-min (sqrt-free),
-  // mapped to a 0..256 per-frame move probability.
-  int m = major + (minor * 7) / 16;
-  if (m <= G_MIN) {
-    s_move_p256 = 0;
-  } else if (m >= G_FULL) {
-    s_move_p256 = 256;
-  } else {
-    s_move_p256 = (m - G_MIN) * 256 / (G_FULL - G_MIN);
-  }
+  int m = major + (minor * 7) / 16;  // ~|(gx,gy)|, sqrt-free
+  o->mp = (m <= G_MIN) ? 0 : (m >= G_FULL ? 256 : (m - G_MIN) * 256 / (G_FULL - G_MIN));
+}
+
+// Derive this frame's global tilt gravity from the accelerometer (zero when
+// Gravity is Off -- force fields still work on top of that).
+static void update_gravity(void) {
+  s_grav_x = s_gravity_on ? s_accel_x : 0;
+  s_grav_y = s_gravity_on ? -s_accel_y : 0;
+  Grav g;
+  reduce_grav(s_grav_x, s_grav_y, &g);
+  s_fdx = g.fdx; s_fdy = g.fdy; s_pdx = g.pdx; s_pdy = g.pdy;
+  s_tside = g.tside; s_lean_num = g.lnum; s_lean_den = g.lden; s_move_p256 = g.mp;
 }
 
 // Try to move the grain at (x,y) into (nx,ny). Moves into empty cells; a powder
@@ -360,15 +375,36 @@ static void update_grain(int gx, int gy) {
     return;
   }
 
+  // Effective gravity for this cell: global tilt, or tilt + force field if a
+  // field tool is active and this cell is inside its radius.
+  int fdx = s_fdx, fdy = s_fdy, pdx = s_pdx, pdy = s_pdy;
+  int tside = s_tside, lnum = s_lean_num, lden = s_lean_den, mp = s_move_p256;
+  if (s_field_on) {
+    int rx = gx - s_field_fx, ry = gy - s_field_fy;
+    int d2 = rx * rx + ry * ry;
+    if (d2 > 0 && d2 <= s_field_rr) {
+      int dist = isqrt_i(d2);
+      // Falloff: strong at the finger, tapering to 0 at the rim. Where mag drops
+      // below tilt gravity the outer cells just fall normally. rx/dist ~= unit.
+      int mag = FIELD_STR * (s_field_R - dist) / s_field_R;
+      int ex = s_grav_x + s_field_sign * rx * mag / dist;  // sign: -toward/+away
+      int ey = s_grav_y + s_field_sign * ry * mag / dist;
+      Grav g;
+      reduce_grav(ex, ey, &g);
+      fdx = g.fdx; fdy = g.fdy; pdx = g.pdx; pdy = g.pdy;
+      tside = g.tside; lnum = g.lnum; lden = g.lden; mp = g.mp;
+    }
+  }
+
   // Gravity-magnitude gate: maybe rest this frame.
-  if (s_move_p256 < 256 && (int)(xrand() & 255) >= s_move_p256) {
+  if (mp < 256 && (int)(xrand() & 255) >= mp) {
     return;
   }
 
-  // Lateral lean (perpendicular offset): toward the tilt with prob minor/major.
+  // Lateral lean (perpendicular offset): toward the field/tilt with prob lnum/lden.
   int lean = 0;
-  if (s_tside != 0 && (int)(xrand() % (uint32_t)s_lean_den) < s_lean_num) {
-    lean = s_tside;
+  if (tside != 0 && (int)(xrand() % (uint32_t)lden) < lnum) {
+    lean = tside;
   }
 
   // Forward-slice attempt order. Going straight: random side then the other so
@@ -386,7 +422,7 @@ static void update_grain(int gx, int gy) {
   }
   for (int i = 0; i < cnt; i++) {
     int p = order[i];
-    if (try_move(gx, gy, gx + s_fdx + s_pdx * p, gy + s_fdy + s_pdy * p, beh)) {
+    if (try_move(gx, gy, gx + fdx + pdx * p, gy + fdy + pdy * p, beh)) {
       return;
     }
   }
@@ -396,7 +432,7 @@ static void update_grain(int gx, int gy) {
     int s = (xrand() & 1) ? 1 : -1;
     for (int t = 0; t < 2; t++) {
       int dir = (t == 0) ? s : -s;
-      if (try_move(gx, gy, gx + s_pdx * dir, gy + s_pdy * dir, beh)) {
+      if (try_move(gx, gy, gx + pdx * dir, gy + pdy * dir, beh)) {
         return;
       }
     }
@@ -408,8 +444,22 @@ static void update_grain(int gx, int gy) {
 // avoid moving a grain twice. Vertical-dominant gravity loops rows outer (inner
 // columns alternate for symmetry); horizontal-dominant swaps the nesting.
 static void sim_step(void) {
-  if (s_move_p256 == 0) {
-    return;  // flat / gravity off: everything rests
+  // Set up the force field (if a field tool is held down) for this frame.
+  s_field_on = false;
+#if defined(PBL_TOUCH)
+  if (s_touch_active && (s_tool == TOOL_ATTRACT || s_tool == TOOL_REPEL)) {
+    s_field_on = true;
+    s_field_fx = s_touch_gx;
+    s_field_fy = s_touch_gy;
+    s_field_sign = (s_tool == TOOL_ATTRACT) ? -1 : 1;
+    s_field_R = s_brush_r * 8 + 16;   // ~4x the old reach
+    if (s_field_R > FIELD_MAX_R) s_field_R = FIELD_MAX_R;
+    s_field_rr = s_field_R * s_field_R;
+  }
+#endif
+
+  if (s_move_p256 == 0 && !s_field_on) {
+    return;  // flat / gravity off and no field: everything rests
   }
   memset(s_moved, 0, sizeof(s_moved));
   bool flip = (s_frame & 1);
@@ -556,8 +606,8 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
 // --- Frame loop --------------------------------------------------------------
 static void timer_cb(void *data) {
 #if defined(PBL_TOUCH)
-  // Keep depositing while the finger is held down or dragging.
-  if (s_touch_active) {
+  // Brush/Eraser paint each frame; Attract/Repel act via the sim's force field.
+  if (s_touch_active && (s_tool == TOOL_BRUSH || s_tool == TOOL_ERASER)) {
     paint_brush(s_touch_gx, s_touch_gy);
   }
 #endif
@@ -587,7 +637,10 @@ static void touch_handler(const TouchEvent *event, void *context) {
       s_touch_gx = clamp_i(event->x / CELL_SIZE, 0, GRID_W - 1);
       s_touch_gy = clamp_i(event->y / CELL_SIZE, 0, GRID_H - 1);
       s_touch_active = true;
-      paint_brush(s_touch_gx, s_touch_gy);
+      // Paint immediately for instant feedback; force tools act in the sim.
+      if (s_tool == TOOL_BRUSH || s_tool == TOOL_ERASER) {
+        paint_brush(s_touch_gx, s_touch_gy);
+      }
       break;
     case TouchEvent_Liftoff:
       s_touch_active = false;
