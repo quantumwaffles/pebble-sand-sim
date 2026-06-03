@@ -95,6 +95,8 @@ static bool s_field_on = false;
 static int  s_field_fx = 0, s_field_fy = 0;   // finger cell
 static int  s_field_sign = -1;                // -1 attract (toward), +1 repel
 static int  s_field_R = 0, s_field_rr = 0;
+static bool s_field_push = false;             // Push: uniform field in drag dir
+static int  s_field_dirx = 0, s_field_diry = 0;
 
 // Latest accelerometer sample, refreshed by the data-service handler (which
 // keeps the sensor continuously sampling -- far fresher than on-demand peek).
@@ -108,6 +110,8 @@ static int s_accel_y = -1000;
 static bool s_touch_active = false;
 static int  s_touch_gx = 0;
 static int  s_touch_gy = 0;
+static int  s_touch_px = 0, s_touch_py = 0;   // current pixel position
+static int  s_prev_px = 0,  s_prev_py = 0;    // pixel position last field pass
 #endif
 
 // Each visual is a 4-shade ramp (raw argb bytes), so a grain can be tinted for a
@@ -128,8 +132,12 @@ static int s_material_count = 4;       // valid material indices are 1..4
 
 // Tools: how the finger interacts with the canvas. Brush paints the selected
 // material; Eraser removes; Attract/Repel bend gravity locally (sink / source).
-typedef enum { TOOL_BRUSH, TOOL_ERASER, TOOL_ATTRACT, TOOL_REPEL, NUM_TOOLS } Tool;
-static const char *TOOL_NAMES[NUM_TOOLS] = { "Brush", "Eraser", "Attract", "Repel" };
+typedef enum {
+  TOOL_BRUSH, TOOL_ERASER, TOOL_ATTRACT, TOOL_REPEL, TOOL_PUSH, NUM_TOOLS
+} Tool;
+static const char *TOOL_NAMES[NUM_TOOLS] = {
+  "Brush", "Eraser", "Attract", "Repel", "Push"
+};
 
 // --- User settings (changed live from the menu) ------------------------------
 static int  s_brush_mat = 1;          // selected material, 1..s_material_count
@@ -385,10 +393,16 @@ static void update_grain(int gx, int gy) {
     if (d2 > 0 && d2 <= s_field_rr) {
       int dist = isqrt_i(d2);
       // Falloff: strong at the finger, tapering to 0 at the rim. Where mag drops
-      // below tilt gravity the outer cells just fall normally. rx/dist ~= unit.
+      // below tilt gravity the outer cells just fall normally.
       int mag = FIELD_STR * (s_field_R - dist) / s_field_R;
-      int ex = s_grav_x + s_field_sign * rx * mag / dist;  // sign: -toward/+away
-      int ey = s_grav_y + s_field_sign * ry * mag / dist;
+      int ex, ey;
+      if (s_field_push) {
+        ex = s_grav_x + s_field_dirx * mag;   // uniform drag direction
+        ey = s_grav_y + s_field_diry * mag;
+      } else {
+        ex = s_grav_x + s_field_sign * rx * mag / dist;  // -toward / +away (radial)
+        ey = s_grav_y + s_field_sign * ry * mag / dist;
+      }
       Grav g;
       reduce_grav(ex, ey, &g);
       fdx = g.fdx; fdy = g.fdy; pdx = g.pdx; pdy = g.pdy;
@@ -447,14 +461,28 @@ static void sim_step(void) {
   // Set up the force field (if a field tool is held down) for this frame.
   s_field_on = false;
 #if defined(PBL_TOUCH)
-  if (s_touch_active && (s_tool == TOOL_ATTRACT || s_tool == TOOL_REPEL)) {
+  if (s_touch_active &&
+      (s_tool == TOOL_ATTRACT || s_tool == TOOL_REPEL || s_tool == TOOL_PUSH)) {
     s_field_on = true;
     s_field_fx = s_touch_gx;
     s_field_fy = s_touch_gy;
-    s_field_sign = (s_tool == TOOL_ATTRACT) ? -1 : 1;
     s_field_R = s_brush_r * 8 + 16;   // ~4x the old reach
     if (s_field_R > FIELD_MAX_R) s_field_R = FIELD_MAX_R;
     s_field_rr = s_field_R * s_field_R;
+    s_field_push = (s_tool == TOOL_PUSH);
+    if (s_field_push) {
+      int ddx = s_touch_px - s_prev_px;   // drag since last frame (pixels)
+      int ddy = s_touch_py - s_prev_py;
+      s_field_dirx = (ddx > 0) - (ddx < 0);
+      s_field_diry = (ddy > 0) - (ddy < 0);
+      if (s_field_dirx == 0 && s_field_diry == 0) {
+        s_field_on = false;             // not dragging -> no push
+      }
+    } else {
+      s_field_sign = (s_tool == TOOL_ATTRACT) ? -1 : 1;
+    }
+    s_prev_px = s_touch_px;
+    s_prev_py = s_touch_py;
   }
 #endif
 
@@ -636,6 +664,12 @@ static void touch_handler(const TouchEvent *event, void *context) {
     case TouchEvent_PositionUpdate:
       s_touch_gx = clamp_i(event->x / CELL_SIZE, 0, GRID_W - 1);
       s_touch_gy = clamp_i(event->y / CELL_SIZE, 0, GRID_H - 1);
+      if (event->type == TouchEvent_Touchdown) {
+        s_prev_px = event->x;  // no drag delta on the first frame
+        s_prev_py = event->y;
+      }
+      s_touch_px = event->x;
+      s_touch_py = event->y;
       s_touch_active = true;
       // Paint immediately for instant feedback; force tools act in the sim.
       if (s_tool == TOOL_BRUSH || s_tool == TOOL_ERASER) {
