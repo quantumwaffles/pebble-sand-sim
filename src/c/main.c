@@ -59,6 +59,10 @@ typedef struct { uint8_t behavior; uint8_t visual; const char *name; } Material;
 #define FIELD_MAX_R 48
 #define FIELD_STR   3500   // pull at the finger; tapers to 0 at the rim
 
+// Screen center in cells, for the Center gravity mode.
+#define GRAV_CX (GRID_W / 2)
+#define GRAV_CY (GRID_H / 2)
+
 // --- Timing ------------------------------------------------------------------
 #define FRAME_MS 33                // ~30 fps
 
@@ -91,6 +95,7 @@ static int s_move_p256 = 256;
 // Tilt-gravity vector this frame (screen-space, x right / y down). Force-field
 // tools add a per-cell vector to this. Field params set each frame in sim_step.
 static int  s_grav_x = 0, s_grav_y = 1000;
+static bool s_grav_center = false;            // Center mode: gravity per-cell
 static bool s_field_on = false;
 static int  s_field_fx = 0, s_field_fy = 0;   // finger cell
 static int  s_field_sign = -1;                // -1 attract (toward), +1 repel
@@ -139,11 +144,18 @@ static const char *TOOL_NAMES[NUM_TOOLS] = {
   "Brush", "Eraser", "Attract", "Repel", "Push"
 };
 
-// --- User settings (changed live from the menu) ------------------------------
+// Gravity modes: Sensor = accelerometer tilt; Off = none (freeze/build); Static
+// = always down (later: a submenu for N/S/E/W); Center = toward screen center.
+typedef enum {
+  GMODE_SENSOR, GMODE_OFF, GMODE_STATIC, GMODE_CENTER, NUM_GMODES
+} GravMode;
+static const char *GMODE_NAMES[NUM_GMODES] = { "Sensor", "Off", "Static", "Center" };
+
+// --- User settings (committed from the menu) ---------------------------------
 static int  s_brush_mat = 1;          // selected material, 1..s_material_count
 static int  s_tool = TOOL_BRUSH;      // active tool
 static int  s_brush_r = 2;            // paint brush radius, BRUSH_MIN..BRUSH_MAX
-static bool s_gravity_on = true;      // false freezes everything (build mode)
+static int  s_gravity_mode = GMODE_SENSOR;
 static bool s_bounds_on = true;       // false lets material flow off-screen
 
 // --- Menu --------------------------------------------------------------------
@@ -327,13 +339,22 @@ static void reduce_grav(int gx, int gy, Grav *o) {
   o->mp = (m <= G_MIN) ? 0 : (m >= G_FULL ? 256 : (m - G_MIN) * 256 / (G_FULL - G_MIN));
 }
 
-// Derive this frame's global tilt gravity from the accelerometer (zero when
-// Gravity is Off -- force fields still work on top of that).
+// Derive this frame's global gravity from the current mode. Center is per-cell
+// (handled in update_grain), so here it just flags that and leaves the global
+// vector zero. Force fields still work on top of any mode.
 static void update_gravity(void) {
-  s_grav_x = s_gravity_on ? s_accel_x : 0;
-  s_grav_y = s_gravity_on ? -s_accel_y : 0;
+  s_grav_center = false;
+  int gx = 0, gy = 0;
+  switch (s_gravity_mode) {
+    case GMODE_SENSOR: gx = s_accel_x; gy = -s_accel_y; break;
+    case GMODE_OFF:    break;                       // no gravity (freeze)
+    case GMODE_STATIC: gy = G_FULL; break;          // always down
+    case GMODE_CENTER: s_grav_center = true; break; // toward center, per-cell
+  }
+  s_grav_x = gx;
+  s_grav_y = gy;
   Grav g;
-  reduce_grav(s_grav_x, s_grav_y, &g);
+  reduce_grav(gx, gy, &g);
   s_fdx = g.fdx; s_fdy = g.fdy; s_pdx = g.pdx; s_pdy = g.pdy;
   s_tside = g.tside; s_lean_num = g.lnum; s_lean_den = g.lden; s_move_p256 = g.mp;
 }
@@ -384,31 +405,41 @@ static void update_grain(int gx, int gy) {
     return;
   }
 
-  // Effective gravity for this cell: global tilt, or tilt + force field if a
-  // field tool is active and this cell is inside its radius.
+  // Effective gravity for this cell. Fast path: uniform global gravity. Per-cell
+  // path: Center mode (gravity toward screen center) and/or an active force field.
   int fdx = s_fdx, fdy = s_fdy, pdx = s_pdx, pdy = s_pdy;
   int tside = s_tside, lnum = s_lean_num, lden = s_lean_den, mp = s_move_p256;
-  if (s_field_on) {
-    int rx = gx - s_field_fx, ry = gy - s_field_fy;
-    int d2 = rx * rx + ry * ry;
-    if (d2 > 0 && d2 <= s_field_rr) {
-      int dist = isqrt_i(d2);
-      // Falloff: strong at the finger, tapering to 0 at the rim. Where mag drops
-      // below tilt gravity the outer cells just fall normally.
-      int mag = FIELD_STR * (s_field_R - dist) / s_field_R;
-      int ex, ey;
-      if (s_field_push) {
-        ex = s_grav_x + s_field_dirx * mag;   // uniform drag direction
-        ey = s_grav_y + s_field_diry * mag;
-      } else {
-        ex = s_grav_x + s_field_sign * rx * mag / dist;  // -toward / +away (radial)
-        ey = s_grav_y + s_field_sign * ry * mag / dist;
-      }
-      Grav g;
-      reduce_grav(ex, ey, &g);
-      fdx = g.fdx; fdy = g.fdy; pdx = g.pdx; pdy = g.pdy;
-      tside = g.tside; lnum = g.lnum; lden = g.lden; mp = g.mp;
+
+  int frx = gx - s_field_fx, fry = gy - s_field_fy;
+  int fd2 = frx * frx + fry * fry;
+  bool field_here = s_field_on && fd2 > 0 && fd2 <= s_field_rr;
+
+  if (s_grav_center || field_here) {
+    int ex, ey;
+    if (s_grav_center) {
+      int rx = gx - GRAV_CX, ry = gy - GRAV_CY;
+      int d2 = rx * rx + ry * ry;
+      if (d2 == 0) { ex = 0; ey = 0; }
+      else { int d = isqrt_i(d2); ex = -rx * G_FULL / d; ey = -ry * G_FULL / d; }
+    } else {
+      ex = s_grav_x; ey = s_grav_y;
     }
+    if (field_here) {
+      int dist = isqrt_i(fd2);
+      // Falloff: strong at the finger, tapering to 0 at the rim.
+      int mag = FIELD_STR * (s_field_R - dist) / s_field_R;
+      if (s_field_push) {
+        ex += s_field_dirx * mag;            // uniform drag direction
+        ey += s_field_diry * mag;
+      } else {
+        ex += s_field_sign * frx * mag / dist;  // -toward / +away (radial)
+        ey += s_field_sign * fry * mag / dist;
+      }
+    }
+    Grav g;
+    reduce_grav(ex, ey, &g);
+    fdx = g.fdx; fdy = g.fdy; pdx = g.pdx; pdy = g.pdy;
+    tside = g.tside; lnum = g.lnum; lden = g.lden; mp = g.mp;
   }
 
   // Gravity-magnitude gate: maybe rest this frame.
@@ -487,8 +518,8 @@ static void sim_step(void) {
   }
 #endif
 
-  if (s_move_p256 == 0 && !s_field_on) {
-    return;  // flat / gravity off and no field: everything rests
+  if (s_move_p256 == 0 && !s_field_on && !s_grav_center) {
+    return;  // no gravity and no field: everything rests
   }
   memset(s_moved, 0, sizeof(s_moved));
   bool flip = (s_frame & 1);
@@ -528,7 +559,7 @@ static void menu_label_for(char *buf, size_t n, MenuState menu, int cat) {
     case CAT_MATERIAL: snprintf(buf, n, "%s", s_materials[s_pending].name); break;
     case CAT_TOOL:     snprintf(buf, n, "%s", TOOL_NAMES[s_pending]); break;
     case CAT_SIZE:     snprintf(buf, n, "%d", s_pending); break;
-    case CAT_GRAVITY:  snprintf(buf, n, "%s", s_pending ? "On" : "Off"); break;
+    case CAT_GRAVITY:  snprintf(buf, n, "%s", GMODE_NAMES[s_pending]); break;
     case CAT_BOUNDS:   snprintf(buf, n, "%s", s_pending ? "On" : "Off"); break;
     case CAT_CLEAR:    snprintf(buf, n, "Confirm?"); break;
     default:           buf[0] = '\0'; break;
@@ -708,7 +739,7 @@ static int cat_value(int cat) {
     case CAT_MATERIAL: return s_brush_mat;
     case CAT_TOOL:     return s_tool;
     case CAT_SIZE:     return s_brush_r;
-    case CAT_GRAVITY:  return s_gravity_on;
+    case CAT_GRAVITY:  return s_gravity_mode;
     case CAT_BOUNDS:   return s_bounds_on;
     default:           return 0;
   }
@@ -720,7 +751,7 @@ static void cat_commit(int cat, int v) {
     case CAT_MATERIAL: s_brush_mat = v; break;
     case CAT_TOOL:     s_tool = v; break;
     case CAT_SIZE:     s_brush_r = v; break;
-    case CAT_GRAVITY:  s_gravity_on = v; break;
+    case CAT_GRAVITY:  s_gravity_mode = v; break;
     case CAT_BOUNDS:   s_bounds_on = v; break;
     default: break;  // CAT_CLEAR has no value
   }
@@ -742,6 +773,8 @@ static void menu_adjust(int dir) {
       if (s_pending > BRUSH_MAX) s_pending = BRUSH_MIN;
       break;
     case CAT_GRAVITY:
+      s_pending = (s_pending + dir + NUM_GMODES) % NUM_GMODES;
+      break;
     case CAT_BOUNDS:
       s_pending = !s_pending;  // two states: either direction toggles
       break;
