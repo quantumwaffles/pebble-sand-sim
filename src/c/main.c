@@ -5,7 +5,8 @@
 //   - Tilt gravity: the accelerometer steers which way "down" is.
 //   - Update applies the classic forward / forward-diagonal slide rule.
 //   - Rendered by writing the captured framebuffer directly (fast path).
-//   - Select clears the screen.
+//   - Select opens a two-level menu (Color / Size / Gravity / Clear); values
+//     apply live, Back ascends the tree and finally exits.
 
 #include <pebble.h>
 
@@ -19,8 +20,12 @@
 #define MAT_EMPTY 0
 #define MAT_SAND  1
 
-// Paint brush radius, in cells (a filled disc ~5 cells across).
-#define BRUSH_R 2
+// Paint brush radius range, in cells (selectable via the menu).
+#define BRUSH_MIN 1
+#define BRUSH_MAX 5
+
+// Number of grain color palettes selectable via the menu.
+#define NUM_PALETTES 4
 
 // Tilt gravity speed: the sand feels the in-plane projection of gravity (what's
 // left after the component pointing into the glass). Its magnitude sets how
@@ -68,6 +73,29 @@ static int  s_touch_gy = 0;
 #define NUM_SAND 4
 static uint8_t s_sand[NUM_SAND];
 
+// --- User settings (changed live from the menu) ------------------------------
+static int  s_palette = 0;            // index into the color palettes
+static int  s_brush_r = 2;            // paint brush radius, BRUSH_MIN..BRUSH_MAX
+static bool s_gravity_on = true;      // false freezes the sand (build mode)
+
+// --- Menu --------------------------------------------------------------------
+// Two-level menu over a black bar. Select descends (canvas -> categories ->
+// values); Back ascends and finally exits. Values apply live as you cycle them.
+typedef enum { MENU_CLOSED, MENU_L1, MENU_L2 } MenuState;
+static MenuState s_menu = MENU_CLOSED;
+
+typedef enum { CAT_COLOR, CAT_SIZE, CAT_GRAVITY, CAT_CLEAR, NUM_CATS } MenuCat;
+static const char *CAT_NAMES[NUM_CATS] = { "Color", "Size", "Gravity", "Clear" };
+static int s_cat = 0;                 // selected category at level 1
+
+// Affordance arrows (filled triangles): up/down = options cycle (Up/Down),
+// right = Select/descend, left = Back/ascend. Built at window load.
+static const GPathInfo ARROW_UP_INFO    = { 3, (GPoint[]) { {-6, 3},  {6, 3},  {0, -4} } };
+static const GPathInfo ARROW_DOWN_INFO   = { 3, (GPoint[]) { {-6, -3}, {6, -3}, {0, 4}  } };
+static const GPathInfo ARROW_LEFT_INFO   = { 3, (GPoint[]) { {3, -6},  {3, 6},  {-4, 0} } };
+static const GPathInfo ARROW_RIGHT_INFO  = { 3, (GPoint[]) { {-3, -6}, {-3, 6}, {4, 0}  } };
+static GPath *s_arrow_up, *s_arrow_down, *s_arrow_left, *s_arrow_right;
+
 // --- Tiny fast PRNG (xorshift32) --------------------------------------------
 static uint32_t s_rng = 0x1a2b3c4d;
 static inline uint32_t xrand(void) {
@@ -109,14 +137,49 @@ static inline uint8_t cell_color(uint8_t m, int gx, int gy) {
   return GColorWhite.argb;
 }
 
+// --- Color palettes ----------------------------------------------------------
+static const char *PALETTE_NAMES[NUM_PALETTES] = { "Sand", "Ice", "Lime", "Berry" };
+
+// Fill the active sand shades from the chosen palette (4 shades each).
+static void set_palette(int idx) {
+  switch (idx) {
+    default:
+    case 0:  // Sand
+      s_sand[0] = GColorFromRGB(0xAA, 0x88, 0x44).argb;
+      s_sand[1] = GColorFromRGB(0xCC, 0xAA, 0x55).argb;
+      s_sand[2] = GColorFromRGB(0xDD, 0xBB, 0x66).argb;
+      s_sand[3] = GColorFromRGB(0x99, 0x77, 0x33).argb;
+      break;
+    case 1:  // Ice
+      s_sand[0] = GColorFromRGB(0x55, 0xAA, 0xFF).argb;
+      s_sand[1] = GColorFromRGB(0x88, 0xCC, 0xFF).argb;
+      s_sand[2] = GColorFromRGB(0xAA, 0xEE, 0xFF).argb;
+      s_sand[3] = GColorFromRGB(0x33, 0x88, 0xDD).argb;
+      break;
+    case 2:  // Lime
+      s_sand[0] = GColorFromRGB(0x66, 0xCC, 0x33).argb;
+      s_sand[1] = GColorFromRGB(0x99, 0xEE, 0x44).argb;
+      s_sand[2] = GColorFromRGB(0xCC, 0xFF, 0x66).argb;
+      s_sand[3] = GColorFromRGB(0x44, 0x99, 0x22).argb;
+      break;
+    case 3:  // Berry
+      s_sand[0] = GColorFromRGB(0xDD, 0x44, 0x99).argb;
+      s_sand[1] = GColorFromRGB(0xFF, 0x77, 0xBB).argb;
+      s_sand[2] = GColorFromRGB(0xCC, 0x55, 0xFF).argb;
+      s_sand[3] = GColorFromRGB(0x99, 0x33, 0x88).argb;
+      break;
+  }
+}
+
 // --- Simulation --------------------------------------------------------------
 
 // Stamp a filled disc of sand centered on a cell (the paint brush).
 static void paint_brush(int cx, int cy) {
-  for (int dy = -BRUSH_R; dy <= BRUSH_R; dy++) {
-    for (int dx = -BRUSH_R; dx <= BRUSH_R; dx++) {
-      // Rounded disc: the +1 fattens it from a diamond to a ~5-wide blob.
-      if (dx * dx + dy * dy > BRUSH_R * BRUSH_R + 1) {
+  int r = s_brush_r;
+  for (int dy = -r; dy <= r; dy++) {
+    for (int dx = -r; dx <= r; dx++) {
+      // Rounded disc: the +1 fattens it from a diamond to a blob.
+      if (dx * dx + dy * dy > r * r + 1) {
         continue;
       }
       int gx = cx + dx;
@@ -138,6 +201,10 @@ static void paint_brush(int cx, int cy) {
 // angle). The in-plane magnitude sets the per-frame move probability, so a
 // shallow tilt creeps, a steep tilt pours, and a flat watch rests.
 static void update_gravity(void) {
+  if (!s_gravity_on) {
+    s_move_p256 = 0;  // gravity off: freeze the sand (build mode)
+    return;
+  }
   AccelData a;
   if (accel_service_peek(&a) < 0) {
     return;  // sensor busy this frame; keep last gravity
@@ -289,6 +356,55 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
   }
 
   graphics_release_frame_buffer(ctx, fb);
+
+  // Menu overlay: a full-width black bar centered vertically with white text
+  // and affordance arrows.
+  if (s_menu != MENU_CLOSED) {
+    const int bh = 64;
+    int by = (bounds.size.h - bh) / 2;
+    int cx = bounds.size.w / 2;
+    int cy = by + bh / 2;
+    GRect bar = GRect(0, by, bounds.size.w, bh);
+
+    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_fill_rect(ctx, bar, 0, GCornerNone);
+    graphics_context_set_stroke_color(ctx, GColorWhite);
+    graphics_draw_line(ctx, GPoint(0, by), GPoint(bounds.size.w, by));
+    graphics_draw_line(ctx, GPoint(0, by + bh - 1), GPoint(bounds.size.w, by + bh - 1));
+
+    // Arrows. Left (Back) and right (Select) always apply; up/down only when
+    // the current level has options to cycle (everything but the Clear confirm).
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    gpath_move_to(s_arrow_left, GPoint(13, cy));
+    gpath_draw_filled(ctx, s_arrow_left);
+    gpath_move_to(s_arrow_right, GPoint(bounds.size.w - 13, cy));
+    gpath_draw_filled(ctx, s_arrow_right);
+    bool cyclable = (s_menu == MENU_L1) || (s_cat != CAT_CLEAR);
+    if (cyclable) {
+      gpath_move_to(s_arrow_up, GPoint(cx, by + 12));
+      gpath_draw_filled(ctx, s_arrow_up);
+      gpath_move_to(s_arrow_down, GPoint(cx, by + bh - 12));
+      gpath_draw_filled(ctx, s_arrow_down);
+    }
+
+    char buf[24];
+    if (s_menu == MENU_L1) {
+      snprintf(buf, sizeof(buf), "%s", CAT_NAMES[s_cat]);
+    } else {
+      switch (s_cat) {
+        case CAT_COLOR:   snprintf(buf, sizeof(buf), "Color: %s", PALETTE_NAMES[s_palette]); break;
+        case CAT_SIZE:    snprintf(buf, sizeof(buf), "Size: %d", s_brush_r); break;
+        case CAT_GRAVITY: snprintf(buf, sizeof(buf), "Gravity: %s", s_gravity_on ? "On" : "Off"); break;
+        case CAT_CLEAR:   snprintf(buf, sizeof(buf), "Clear?"); break;
+        default:          buf[0] = '\0'; break;
+      }
+    }
+
+    graphics_context_set_text_color(ctx, GColorWhite);
+    GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+    GRect tr = GRect(26, by + (bh - 26) / 2, bounds.size.w - 52, 26);
+    graphics_draw_text(ctx, buf, font, tr, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  }
 }
 
 // --- Frame loop --------------------------------------------------------------
@@ -312,6 +428,10 @@ static void timer_cb(void *data) {
 // the timer loop keeps painting each frame while the finger stays down/drags.
 static void touch_handler(const TouchEvent *event, void *context) {
   (void)context;
+  if (s_menu != MENU_CLOSED) {
+    s_touch_active = false;  // menu is modal: ignore painting while it's open
+    return;
+  }
   switch (event->type) {
     case TouchEvent_Touchdown:
     case TouchEvent_PositionUpdate:
@@ -327,18 +447,99 @@ static void touch_handler(const TouchEvent *event, void *context) {
 }
 #endif
 
-static void select_click(ClickRecognizerRef recognizer, void *context) {
+static void clear_grid(void) {
   memset(s_grid, MAT_EMPTY, sizeof(s_grid));
 }
 
+// Change the focused category's value (dir is +1/-1) and apply it live.
+static void menu_adjust(int dir) {
+  switch (s_cat) {
+    case CAT_COLOR:
+      s_palette = (s_palette + dir + NUM_PALETTES) % NUM_PALETTES;
+      set_palette(s_palette);
+      break;
+    case CAT_SIZE:
+      s_brush_r += dir;
+      if (s_brush_r < BRUSH_MIN) s_brush_r = BRUSH_MAX;
+      if (s_brush_r > BRUSH_MAX) s_brush_r = BRUSH_MIN;
+      break;
+    case CAT_GRAVITY:
+      s_gravity_on = !s_gravity_on;  // two states: either direction toggles
+      break;
+    case CAT_CLEAR:
+      break;  // no value; Select performs the clear
+  }
+}
+
+static void up_click(ClickRecognizerRef recognizer, void *context) {
+  if (s_menu == MENU_L1) {
+    s_cat = (s_cat - 1 + NUM_CATS) % NUM_CATS;
+  } else if (s_menu == MENU_L2) {
+    menu_adjust(+1);
+  }
+}
+
+static void down_click(ClickRecognizerRef recognizer, void *context) {
+  if (s_menu == MENU_L1) {
+    s_cat = (s_cat + 1) % NUM_CATS;
+  } else if (s_menu == MENU_L2) {
+    menu_adjust(-1);
+  }
+}
+
+// Select descends: canvas -> categories -> values. At a value, Select closes the
+// menu (values already applied live); for Clear it performs the wipe first.
+static void select_click(ClickRecognizerRef recognizer, void *context) {
+  switch (s_menu) {
+    case MENU_CLOSED:
+#if defined(PBL_TOUCH)
+      s_touch_active = false;  // stop any in-progress painting as we open
+#endif
+      s_menu = MENU_L1;
+      break;
+    case MENU_L1:
+      s_menu = MENU_L2;
+      break;
+    case MENU_L2:
+      if (s_cat == CAT_CLEAR) {
+        clear_grid();
+      }
+      s_menu = MENU_CLOSED;
+      break;
+  }
+}
+
+// Back ascends the menu tree; at the top it falls through to exit the app.
+static void back_click(ClickRecognizerRef recognizer, void *context) {
+  switch (s_menu) {
+    case MENU_L2:
+      s_menu = MENU_L1;
+      break;
+    case MENU_L1:
+      s_menu = MENU_CLOSED;
+      break;
+    case MENU_CLOSED:
+      window_stack_pop(true);  // exit the app, as Back normally would
+      break;
+  }
+}
+
 static void click_config(void *context) {
+  window_single_click_subscribe(BUTTON_ID_UP, up_click);
+  window_single_click_subscribe(BUTTON_ID_DOWN, down_click);
   window_single_click_subscribe(BUTTON_ID_SELECT, select_click);
+  window_single_click_subscribe(BUTTON_ID_BACK, back_click);
 }
 
 // --- Window / app plumbing ---------------------------------------------------
 static void window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
+
+  s_arrow_up    = gpath_create(&ARROW_UP_INFO);
+  s_arrow_down  = gpath_create(&ARROW_DOWN_INFO);
+  s_arrow_left  = gpath_create(&ARROW_LEFT_INFO);
+  s_arrow_right = gpath_create(&ARROW_RIGHT_INFO);
 
   s_canvas_layer = layer_create(bounds);
   layer_set_update_proc(s_canvas_layer, canvas_update_proc);
@@ -347,17 +548,14 @@ static void window_load(Window *window) {
 
 static void window_unload(Window *window) {
   layer_destroy(s_canvas_layer);
-}
-
-static void init_palette(void) {
-  s_sand[0] = GColorFromRGB(0xAA, 0x88, 0x44).argb;
-  s_sand[1] = GColorFromRGB(0xCC, 0xAA, 0x55).argb;
-  s_sand[2] = GColorFromRGB(0xDD, 0xBB, 0x66).argb;
-  s_sand[3] = GColorFromRGB(0x99, 0x77, 0x33).argb;
+  gpath_destroy(s_arrow_up);
+  gpath_destroy(s_arrow_down);
+  gpath_destroy(s_arrow_left);
+  gpath_destroy(s_arrow_right);
 }
 
 static void init(void) {
-  init_palette();
+  set_palette(s_palette);
 
   s_window = window_create();
   window_set_background_color(s_window, GColorBlack);
