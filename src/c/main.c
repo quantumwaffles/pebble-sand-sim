@@ -7,8 +7,8 @@
 //   - Touch (Emery): tap or drag to paint the selected material; Eraser removes.
 //   - Tilt gravity: the accelerometer steers which way "down" is.
 //   - Rendered by writing the captured framebuffer directly (fast path).
-//   - Select opens a two-level menu (Material / Size / Gravity / Clear); values
-//     apply live, Back ascends the tree and finally exits.
+//   - Select opens a two-level menu (Material / Tool / Size / Gravity / Bounds /
+//     Clear); values apply live, Back ascends the tree and finally exits.
 
 #include <pebble.h>
 
@@ -112,11 +112,17 @@ static Material s_materials[MAX_MATERIALS] = {
 };
 static int s_material_count = 4;       // valid material indices are 1..4
 
+// Tools: how the finger interacts with the canvas (Brush paints the selected
+// material; Eraser removes). A Pusher tool is planned later.
+typedef enum { TOOL_BRUSH, TOOL_ERASER, NUM_TOOLS } Tool;
+static const char *TOOL_NAMES[NUM_TOOLS] = { "Brush", "Eraser" };
+
 // --- User settings (changed live from the menu) ------------------------------
-// Brush material: 0 = Eraser (paints empty), 1..s_material_count = a material.
-static int  s_brush_mat = 1;          // default Sand
+static int  s_brush_mat = 1;          // selected material, 1..s_material_count
+static int  s_tool = TOOL_BRUSH;      // active tool
 static int  s_brush_r = 2;            // paint brush radius, BRUSH_MIN..BRUSH_MAX
 static bool s_gravity_on = true;      // false freezes everything (build mode)
+static bool s_bounds_on = true;       // false lets material flow off-screen
 
 // --- Menu --------------------------------------------------------------------
 // Two-level menu over a black bar. Select descends (canvas -> categories ->
@@ -124,8 +130,12 @@ static bool s_gravity_on = true;      // false freezes everything (build mode)
 typedef enum { MENU_CLOSED, MENU_L1, MENU_L2 } MenuState;
 static MenuState s_menu = MENU_CLOSED;
 
-typedef enum { CAT_MATERIAL, CAT_SIZE, CAT_GRAVITY, CAT_CLEAR, NUM_CATS } MenuCat;
-static const char *CAT_NAMES[NUM_CATS] = { "Material", "Size", "Gravity", "Clear" };
+typedef enum {
+  CAT_MATERIAL, CAT_TOOL, CAT_SIZE, CAT_GRAVITY, CAT_BOUNDS, CAT_CLEAR, NUM_CATS
+} MenuCat;
+static const char *CAT_NAMES[NUM_CATS] = {
+  "Material", "Tool", "Size", "Gravity", "Bounds", "Clear"
+};
 static int s_cat = 0;                 // selected category at level 1
 
 // Affordance arrows (filled triangles): up/down = options cycle (Up/Down),
@@ -231,12 +241,12 @@ static void build_visuals(void) {
 
 // --- Simulation --------------------------------------------------------------
 
-// Stamp a filled disc of the selected material centered on a cell. The Eraser
-// (brush 0) overwrites anything with empty; a material only fills empty cells
-// (so you don't accidentally paint over existing structures -- erase first).
+// Stamp a filled disc centered on a cell. The Eraser tool overwrites anything
+// with empty; the Brush only fills empty cells with the selected material (so
+// you don't accidentally paint over existing structures -- erase first).
 static void paint_brush(int cx, int cy) {
   int r = s_brush_r;
-  uint8_t target = (uint8_t)s_brush_mat;
+  bool erase = (s_tool == TOOL_ERASER);
   for (int dy = -r; dy <= r; dy++) {
     for (int dx = -r; dx <= r; dx++) {
       // Rounded disc: the +1 fattens it from a diamond to a blob.
@@ -248,10 +258,10 @@ static void paint_brush(int cx, int cy) {
       if (gx < 0 || gx >= GRID_W || gy < 0 || gy >= GRID_H) {
         continue;
       }
-      if (target == MAT_EMPTY) {
-        set_cell(gx, gy, MAT_EMPTY);            // eraser
+      if (erase) {
+        set_cell(gx, gy, MAT_EMPTY);
       } else if (cell_at(gx, gy) == MAT_EMPTY) {
-        set_cell(gx, gy, target);
+        set_cell(gx, gy, (uint8_t)s_brush_mat);
       }
     }
   }
@@ -309,7 +319,11 @@ static void update_gravity(void) {
 // nothing moves twice this frame. Returns true if it moved.
 static bool try_move(int x, int y, int nx, int ny, Behavior beh) {
   if (!in_bounds(nx, ny)) {
-    return false;
+    if (!s_bounds_on) {
+      set_cell(x, y, MAT_EMPTY);  // bounds off: the grain flows off-screen
+      return true;
+    }
+    return false;  // closed container: the edge is a wall
   }
   uint8_t src = cell_at(x, y);
   uint8_t dst = cell_at(nx, ny);
@@ -431,14 +445,13 @@ static void menu_label_for(char *buf, size_t n, MenuState menu, int cat) {
     return;
   }
   switch (cat) {
-    case CAT_MATERIAL:
-      if (s_brush_mat == 0) snprintf(buf, n, "Eraser");
-      else snprintf(buf, n, "%s", s_materials[s_brush_mat].name);
-      break;
-    case CAT_SIZE:    snprintf(buf, n, "%d", s_brush_r); break;
-    case CAT_GRAVITY: snprintf(buf, n, "%s", s_gravity_on ? "On" : "Off"); break;
-    case CAT_CLEAR:   snprintf(buf, n, "Confirm?"); break;
-    default:          buf[0] = '\0'; break;
+    case CAT_MATERIAL: snprintf(buf, n, "%s", s_materials[s_brush_mat].name); break;
+    case CAT_TOOL:     snprintf(buf, n, "%s", TOOL_NAMES[s_tool]); break;
+    case CAT_SIZE:     snprintf(buf, n, "%d", s_brush_r); break;
+    case CAT_GRAVITY:  snprintf(buf, n, "%s", s_gravity_on ? "On" : "Off"); break;
+    case CAT_BOUNDS:   snprintf(buf, n, "%s", s_bounds_on ? "On" : "Off"); break;
+    case CAT_CLEAR:    snprintf(buf, n, "Confirm?"); break;
+    default:           buf[0] = '\0'; break;
   }
 }
 
@@ -603,11 +616,13 @@ static void menu_slide(MenuState from_m, int from_c, MenuState to_m, int to_c, i
 // Change the focused category's value (dir is +1/-1) and apply it live.
 static void menu_adjust(int dir) {
   switch (s_cat) {
-    case CAT_MATERIAL: {
-      int opts = s_material_count + 1;  // Eraser (0) + materials 1..count
-      s_brush_mat = (s_brush_mat + dir + opts) % opts;
+    case CAT_MATERIAL:
+      // Materials are indices 1..count; cycle within that range.
+      s_brush_mat = (s_brush_mat - 1 + dir + s_material_count) % s_material_count + 1;
       break;
-    }
+    case CAT_TOOL:
+      s_tool = (s_tool + dir + NUM_TOOLS) % NUM_TOOLS;
+      break;
     case CAT_SIZE:
       s_brush_r += dir;
       if (s_brush_r < BRUSH_MIN) s_brush_r = BRUSH_MAX;
@@ -615,6 +630,9 @@ static void menu_adjust(int dir) {
       break;
     case CAT_GRAVITY:
       s_gravity_on = !s_gravity_on;  // two states: either direction toggles
+      break;
+    case CAT_BOUNDS:
+      s_bounds_on = !s_bounds_on;
       break;
     case CAT_CLEAR:
       break;  // no value; Select performs the clear
