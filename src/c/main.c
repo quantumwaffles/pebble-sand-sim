@@ -143,11 +143,14 @@ static int ring_index(int dx, int dy) {
   return 0;
 }
 
-// Snap the accelerometer reading to one of the 8 ring directions in screen
-// space. Mapping (from the fluid-sim, tested): screen-right = a.x, down = -a.y.
-// A direction's smaller component is kept when it is at least tan(22.5 deg) ~=
-// 0.414 of the larger, which carves the circle into eight equal 45 deg wedges.
-// Within the deadzone (watch near-flat) we keep the previous direction.
+// Pick this frame's gravity direction from the accelerometer with probabilistic
+// blending, so the time-averaged flow tracks the exact tilt angle (analog feel)
+// while each frame still uses one discrete ring direction (keeps the sim_step
+// scan order correct). Mapping (from the fluid-sim, tested): screen-right = a.x,
+// down = -a.y. Any in-plane tilt sits between the dominant cardinal direction
+// and the quadrant diagonal; we pick the diagonal with probability minor/major
+// (how diagonal the tilt is) and the cardinal otherwise. Within the deadzone
+// (watch near-flat) we keep the previous direction.
 static void update_gravity(void) {
   AccelData a;
   if (accel_service_peek(&a) < 0) {
@@ -157,14 +160,26 @@ static void update_gravity(void) {
   int gy = -a.y;   // gravity component toward screen-down
   int ax = gx < 0 ? -gx : gx;
   int ay = gy < 0 ? -gy : gy;
-  if (ax < GRAV_DEADZONE && ay < GRAV_DEADZONE) {
+  int major = ax > ay ? ax : ay;
+  int minor = ax > ay ? ay : ax;
+  if (major < GRAV_DEADZONE) {
     return;  // too flat to tell which way is down; keep last direction
   }
-  // Include an axis if it is at least tan(22.5 deg) of the other (414/1000).
-  bool keep_x = (ax * 1000 >= ay * 414);
-  bool keep_y = (ay * 1000 >= ax * 414);
-  s_gdx = keep_x ? (gx > 0 ? 1 : -1) : 0;
-  s_gdy = keep_y ? (gy > 0 ? 1 : -1) : 0;
+
+  int sx = gx > 0 ? 1 : (gx < 0 ? -1 : 0);
+  int sy = gy > 0 ? 1 : (gy < 0 ? -1 : 0);
+
+  if ((int)(xrand() % (uint32_t)major) < minor) {
+    // Diagonal: chosen more often the more diagonal the tilt is.
+    s_gdx = sx;
+    s_gdy = sy;
+  } else if (ax >= ay) {
+    s_gdx = sx;  // dominant cardinal is horizontal
+    s_gdy = 0;
+  } else {
+    s_gdx = 0;   // dominant cardinal is vertical
+    s_gdy = sy;
+  }
 }
 
 // Move one grain: try straight "forward" (along gravity), then the two slide
