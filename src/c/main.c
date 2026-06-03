@@ -1,11 +1,13 @@
 // Pebble Sand Sim
-// Milestone 1-3: a falling-sand cellular automaton.
-//   - Grid of cells, each holding a material id.
-//   - Touch (Emery): tap or drag to paint a brush of sand at your finger.
+// A falling-sand cellular automaton.
+//   - Grid of cells; each cell holds an index into a material table.
+//   - A material = a (behavior, visual) pair. Behavior drives physics (powder /
+//     liquid / solid); visual drives color. The two axes are independent, so the
+//     same look can have different physics and vice versa.
+//   - Touch (Emery): tap or drag to paint the selected material; Eraser removes.
 //   - Tilt gravity: the accelerometer steers which way "down" is.
-//   - Update applies the classic forward / forward-diagonal slide rule.
 //   - Rendered by writing the captured framebuffer directly (fast path).
-//   - Select opens a two-level menu (Color / Size / Gravity / Clear); values
+//   - Select opens a two-level menu (Material / Size / Gravity / Clear); values
 //     apply live, Back ascends the tree and finally exits.
 
 #include <pebble.h>
@@ -16,19 +18,33 @@
 #define GRID_W (200 / CELL_SIZE)   // 50
 #define GRID_H (228 / CELL_SIZE)   // 57
 
-// --- Materials ---------------------------------------------------------------
+// --- Materials & visuals -----------------------------------------------------
+// Cell value 0 = empty; 1..s_material_count index the material table.
 #define MAT_EMPTY 0
-#define MAT_SAND  1
+
+// Behavior axis (physics).
+typedef enum { BEH_POWDER, BEH_LIQUID, BEH_SOLID } Behavior;
+
+// Visual axis (color). Indices into the visuals table. Ember and Gold are
+// special-cased in cell_color to animate (glow / glisten).
+#define NUM_VISUALS 9
+#define VIS_SAND   0
+#define VIS_ICE    1
+#define VIS_LIME   2
+#define VIS_BERRY  3
+#define VIS_CHERRY 4
+#define VIS_AMBER  5
+#define VIS_EMBER  6
+#define VIS_GOLD   7
+#define VIS_SLATE  8
+
+// A material is a (behavior, visual) preset with a display name.
+typedef struct { uint8_t behavior; uint8_t visual; const char *name; } Material;
+#define MAX_MATERIALS 16
 
 // Paint brush radius range, in cells (selectable via the menu).
 #define BRUSH_MIN 1
 #define BRUSH_MAX 5
-
-// Grain color palettes selectable via the menu. Ember and Gold are special-cased
-// in cell_color to animate (glow / glisten) instead of a static per-grain shade.
-#define NUM_PALETTES 8
-#define PALETTE_EMBER 6
-#define PALETTE_GOLD  7
 
 // Tilt gravity speed: the sand feels the in-plane projection of gravity (what's
 // left after the component pointing into the glass). Its magnitude sets how
@@ -44,8 +60,11 @@ static Window *s_window;
 static Layer *s_canvas_layer;
 static AppTimer *s_timer;
 
-// The world. Row-major: grid[gy * GRID_W + gx].
+// The world. Row-major: grid[gy * GRID_W + gx]. Each value is a material index
+// (0 = empty). s_moved marks cells already moved this frame so no grain moves
+// twice (lets liquids flow sideways safely).
 static uint8_t s_grid[GRID_W * GRID_H];
+static uint8_t s_moved[GRID_W * GRID_H];
 
 static uint32_t s_frame;
 
@@ -77,15 +96,27 @@ static int  s_touch_gx = 0;
 static int  s_touch_gy = 0;
 #endif
 
-// A few sand shades (filled in at init from GColor, stored as raw argb bytes)
-// so each grain can be tinted for a speckled, sandy texture at zero memory cost.
-#define NUM_SAND 4
-static uint8_t s_sand[NUM_SAND];
+// Each visual is a 4-shade ramp (raw argb bytes), so a grain can be tinted for a
+// speckled texture at zero per-cell cost. Built at init by build_visuals().
+#define NUM_SHADES 4
+static uint8_t s_visuals[NUM_VISUALS][NUM_SHADES];
+
+// Material table. Index 0 is the empty placeholder; 1..s_material_count are real
+// materials. cell_color reads .visual; sim_step switches on .behavior.
+static Material s_materials[MAX_MATERIALS] = {
+  { BEH_SOLID,  0,         ""      },  // 0: empty (placeholder, never painted)
+  { BEH_POWDER, VIS_SAND,  "Sand"  },  // 1
+  { BEH_LIQUID, VIS_ICE,   "Water" },  // 2
+  { BEH_SOLID,  VIS_SLATE, "Stone" },  // 3
+  { BEH_LIQUID, VIS_EMBER, "Lava"  },  // 4
+};
+static int s_material_count = 4;       // valid material indices are 1..4
 
 // --- User settings (changed live from the menu) ------------------------------
-static int  s_palette = 0;            // index into the color palettes
+// Brush material: 0 = Eraser (paints empty), 1..s_material_count = a material.
+static int  s_brush_mat = 1;          // default Sand
 static int  s_brush_r = 2;            // paint brush radius, BRUSH_MIN..BRUSH_MAX
-static bool s_gravity_on = true;      // false freezes the sand (build mode)
+static bool s_gravity_on = true;      // false freezes everything (build mode)
 
 // --- Menu --------------------------------------------------------------------
 // Two-level menu over a black bar. Select descends (canvas -> categories ->
@@ -93,8 +124,8 @@ static bool s_gravity_on = true;      // false freezes the sand (build mode)
 typedef enum { MENU_CLOSED, MENU_L1, MENU_L2 } MenuState;
 static MenuState s_menu = MENU_CLOSED;
 
-typedef enum { CAT_COLOR, CAT_SIZE, CAT_GRAVITY, CAT_CLEAR, NUM_CATS } MenuCat;
-static const char *CAT_NAMES[NUM_CATS] = { "Color", "Size", "Gravity", "Clear" };
+typedef enum { CAT_MATERIAL, CAT_SIZE, CAT_GRAVITY, CAT_CLEAR, NUM_CATS } MenuCat;
+static const char *CAT_NAMES[NUM_CATS] = { "Material", "Size", "Gravity", "Clear" };
 static int s_cat = 0;                 // selected category at level 1
 
 // Affordance arrows (filled triangles): up/down = options cycle (Up/Down),
@@ -142,102 +173,70 @@ static inline bool in_bounds(int gx, int gy) {
   return gx >= 0 && gx < GRID_W && gy >= 0 && gy < GRID_H;
 }
 
-// Per-grain tint: hash the cell coordinate into the palette so a settled grain
-// keeps the same shade frame to frame. The integer finalizer (xxHash-style)
-// avalanches the bits so even the low bits we index with look like random noise
-// rather than regular diagonal bands. Ember is the exception: each grain's index
-// is animated along the dark->hot ramp on its own phase, so the bed glows.
-static inline uint8_t cell_color(uint8_t m, int gx, int gy) {
-  if (m == MAT_SAND) {
-    uint32_t h = (uint32_t)gx * 374761393u + (uint32_t)gy * 668265263u;
-    h = (h ^ (h >> 13)) * 1274126177u;
-    h ^= h >> 16;
-    int idx;
-    if (s_palette == PALETTE_EMBER) {
-      // Triangle wave over time, offset per grain by its hash, so grains drift
-      // up and down the 4-step ramp out of sync -> a shimmering ember glow.
-      uint32_t a = (s_frame * 5u + (h & 0xFFu)) & 0xFFu;
-      uint32_t tri = (a < 128u) ? (a * 2u) : ((255u - a) * 2u);  // 0..254
-      idx = tri >> 6;                                            // 0..3
-    } else if (s_palette == PALETTE_GOLD) {
-      // Mostly a steady gold tone (0-2); each grain briefly flashes the bright
-      // highlight (3) on its own phase, so a sparse few glint at any moment.
-      uint32_t phase = (h >> 5) & 127u;
-      uint32_t t = (s_frame + phase) & 127u;
-      idx = (t < 3u) ? 3 : (int)(h % 3u);
-    } else {
-      idx = h & (NUM_SAND - 1);
-    }
-    return s_sand[idx];
+// Color a cell from its material's visual. Hash the coordinate into the visual's
+// 4-shade ramp so a settled grain keeps a stable speckle (the xxHash-style
+// finalizer avalanches the bits so even the low bits look like noise, not bands).
+// Ember and Gold animate their shade index instead of holding it static.
+static inline uint8_t cell_color(uint8_t mv, int gx, int gy) {
+  int visual = s_materials[mv].visual;
+  uint32_t h = (uint32_t)gx * 374761393u + (uint32_t)gy * 668265263u;
+  h = (h ^ (h >> 13)) * 1274126177u;
+  h ^= h >> 16;
+
+  int idx;
+  if (visual == VIS_EMBER) {
+    // Triangle wave over time, offset per grain by its hash, so grains drift up
+    // and down the 4-step ramp out of sync -> a shimmering ember glow.
+    uint32_t a = (s_frame * 5u + (h & 0xFFu)) & 0xFFu;
+    uint32_t tri = (a < 128u) ? (a * 2u) : ((255u - a) * 2u);  // 0..254
+    idx = tri >> 6;                                            // 0..3
+  } else if (visual == VIS_GOLD) {
+    // Mostly a steady gold tone (0-2); each grain briefly flashes the bright
+    // highlight (3) on its own phase, so a sparse few glint at any moment.
+    uint32_t phase = (h >> 5) & 127u;
+    uint32_t t = (s_frame + phase) & 127u;
+    idx = (t < 3u) ? 3 : (int)(h % 3u);
+  } else {
+    idx = h & (NUM_SHADES - 1);
   }
-  return GColorWhite.argb;
+  return s_visuals[visual][idx];
 }
 
-// --- Color palettes ----------------------------------------------------------
-static const char *PALETTE_NAMES[NUM_PALETTES] = {
-  "Sand", "Ice", "Lime", "Berry", "Cherry", "Amber", "Ember", "Gold"
-};
-
-// Fill the active sand shades from the chosen palette (4 shades each).
-static void set_palette(int idx) {
-  switch (idx) {
-    default:
-    case 0:  // Sand
-      s_sand[0] = GColorFromRGB(0xAA, 0x88, 0x44).argb;
-      s_sand[1] = GColorFromRGB(0xCC, 0xAA, 0x55).argb;
-      s_sand[2] = GColorFromRGB(0xDD, 0xBB, 0x66).argb;
-      s_sand[3] = GColorFromRGB(0x99, 0x77, 0x33).argb;
-      break;
-    case 1:  // Ice
-      s_sand[0] = GColorFromRGB(0x55, 0xAA, 0xFF).argb;
-      s_sand[1] = GColorFromRGB(0x88, 0xCC, 0xFF).argb;
-      s_sand[2] = GColorFromRGB(0xAA, 0xEE, 0xFF).argb;
-      s_sand[3] = GColorFromRGB(0x33, 0x88, 0xDD).argb;
-      break;
-    case 2:  // Lime
-      s_sand[0] = GColorFromRGB(0x66, 0xCC, 0x33).argb;
-      s_sand[1] = GColorFromRGB(0x99, 0xEE, 0x44).argb;
-      s_sand[2] = GColorFromRGB(0xCC, 0xFF, 0x66).argb;
-      s_sand[3] = GColorFromRGB(0x44, 0x99, 0x22).argb;
-      break;
-    case 3:  // Berry
-      s_sand[0] = GColorFromRGB(0xDD, 0x44, 0x99).argb;
-      s_sand[1] = GColorFromRGB(0xFF, 0x77, 0xBB).argb;
-      s_sand[2] = GColorFromRGB(0xCC, 0x55, 0xFF).argb;
-      s_sand[3] = GColorFromRGB(0x99, 0x33, 0x88).argb;
-      break;
-    case 4:  // Cherry
-      s_sand[0] = GColorFromRGB(0xAA, 0x00, 0x00).argb;
-      s_sand[1] = GColorFromRGB(0xFF, 0x00, 0x00).argb;
-      s_sand[2] = GColorFromRGB(0xFF, 0x55, 0x55).argb;
-      s_sand[3] = GColorFromRGB(0xAA, 0x00, 0x55).argb;
-      break;
-    case 5:  // Amber
-      s_sand[0] = GColorFromRGB(0xFF, 0xAA, 0x00).argb;
-      s_sand[1] = GColorFromRGB(0xFF, 0x55, 0x00).argb;
-      s_sand[2] = GColorFromRGB(0xFF, 0xAA, 0x55).argb;
-      s_sand[3] = GColorFromRGB(0xAA, 0x55, 0x00).argb;
-      break;
-    case 6:  // Ember (dark -> hot ramp; cell_color animates the index)
-      s_sand[0] = GColorFromRGB(0x55, 0x00, 0x00).argb;
-      s_sand[1] = GColorFromRGB(0xAA, 0x00, 0x00).argb;
-      s_sand[2] = GColorFromRGB(0xFF, 0x55, 0x00).argb;
-      s_sand[3] = GColorFromRGB(0xFF, 0xAA, 0x00).argb;
-      break;
-    case 7:  // Gold (shades 0-2 are metallic tones; 3 is the glint highlight)
-      s_sand[0] = GColorFromRGB(0xAA, 0x55, 0x00).argb;
-      s_sand[1] = GColorFromRGB(0xFF, 0xAA, 0x00).argb;
-      s_sand[2] = GColorFromRGB(0xFF, 0xAA, 0x55).argb;
-      s_sand[3] = GColorFromRGB(0xFF, 0xFF, 0xAA).argb;
-      break;
-  }
+// --- Visuals -----------------------------------------------------------------
+// Build all visual ramps once at init (GColorFromRGB resolves at runtime).
+static void build_visuals(void) {
+  #define SET4(v, a, b, c, d) do { \
+      s_visuals[v][0] = (a).argb; s_visuals[v][1] = (b).argb; \
+      s_visuals[v][2] = (c).argb; s_visuals[v][3] = (d).argb; } while (0)
+  SET4(VIS_SAND,   GColorFromRGB(0xAA,0x88,0x44), GColorFromRGB(0xCC,0xAA,0x55),
+                   GColorFromRGB(0xDD,0xBB,0x66), GColorFromRGB(0x99,0x77,0x33));
+  SET4(VIS_ICE,    GColorFromRGB(0x55,0xAA,0xFF), GColorFromRGB(0x88,0xCC,0xFF),
+                   GColorFromRGB(0xAA,0xEE,0xFF), GColorFromRGB(0x33,0x88,0xDD));
+  SET4(VIS_LIME,   GColorFromRGB(0x66,0xCC,0x33), GColorFromRGB(0x99,0xEE,0x44),
+                   GColorFromRGB(0xCC,0xFF,0x66), GColorFromRGB(0x44,0x99,0x22));
+  SET4(VIS_BERRY,  GColorFromRGB(0xDD,0x44,0x99), GColorFromRGB(0xFF,0x77,0xBB),
+                   GColorFromRGB(0xCC,0x55,0xFF), GColorFromRGB(0x99,0x33,0x88));
+  SET4(VIS_CHERRY, GColorFromRGB(0xAA,0x00,0x00), GColorFromRGB(0xFF,0x00,0x00),
+                   GColorFromRGB(0xFF,0x55,0x55), GColorFromRGB(0xAA,0x00,0x55));
+  SET4(VIS_AMBER,  GColorFromRGB(0xFF,0xAA,0x00), GColorFromRGB(0xFF,0x55,0x00),
+                   GColorFromRGB(0xFF,0xAA,0x55), GColorFromRGB(0xAA,0x55,0x00));
+  SET4(VIS_EMBER,  GColorFromRGB(0x55,0x00,0x00), GColorFromRGB(0xAA,0x00,0x00),
+                   GColorFromRGB(0xFF,0x55,0x00), GColorFromRGB(0xFF,0xAA,0x00));
+  SET4(VIS_GOLD,   GColorFromRGB(0xAA,0x55,0x00), GColorFromRGB(0xFF,0xAA,0x00),
+                   GColorFromRGB(0xFF,0xAA,0x55), GColorFromRGB(0xFF,0xFF,0xAA));
+  SET4(VIS_SLATE,  GColorFromRGB(0x55,0x55,0x55), GColorFromRGB(0xAA,0xAA,0xAA),
+                   GColorFromRGB(0x88,0x88,0x88), GColorFromRGB(0x66,0x66,0x66));
+  #undef SET4
 }
 
 // --- Simulation --------------------------------------------------------------
 
-// Stamp a filled disc of sand centered on a cell (the paint brush).
+// Stamp a filled disc of the selected material centered on a cell. The Eraser
+// (brush 0) overwrites anything with empty; a material only fills empty cells
+// (so you don't accidentally paint over existing structures -- erase first).
 static void paint_brush(int cx, int cy) {
   int r = s_brush_r;
+  uint8_t target = (uint8_t)s_brush_mat;
   for (int dy = -r; dy <= r; dy++) {
     for (int dx = -r; dx <= r; dx++) {
       // Rounded disc: the +1 fattens it from a diamond to a blob.
@@ -249,8 +248,10 @@ static void paint_brush(int cx, int cy) {
       if (gx < 0 || gx >= GRID_W || gy < 0 || gy >= GRID_H) {
         continue;
       }
-      if (cell_at(gx, gy) == MAT_EMPTY) {
-        set_cell(gx, gy, MAT_SAND);
+      if (target == MAT_EMPTY) {
+        set_cell(gx, gy, MAT_EMPTY);            // eraser
+      } else if (cell_at(gx, gy) == MAT_EMPTY) {
+        set_cell(gx, gy, target);
       }
     }
   }
@@ -303,13 +304,45 @@ static void update_gravity(void) {
   }
 }
 
-// Move one grain. First gate on gravity magnitude (it may rest this frame), then
-// pick a lateral lean toward the tilt and try the forward cell at that lean,
-// falling back through the other forward-slice cells so piles still spread. All
-// candidates lie one step forward along the dominant axis, which keeps the
-// sim_step scan order correct (no grain moves twice per frame).
+// Try to move the grain at (x,y) into (nx,ny). Moves into empty cells; a powder
+// also sinks through a liquid (denser) by swapping with it. Marks moved cells so
+// nothing moves twice this frame. Returns true if it moved.
+static bool try_move(int x, int y, int nx, int ny, Behavior beh) {
+  if (!in_bounds(nx, ny)) {
+    return false;
+  }
+  uint8_t src = cell_at(x, y);
+  uint8_t dst = cell_at(nx, ny);
+  if (dst == MAT_EMPTY) {
+    set_cell(nx, ny, src);
+    set_cell(x, y, MAT_EMPTY);
+    s_moved[ny * GRID_W + nx] = 1;
+    return true;
+  }
+  if (beh == BEH_POWDER && s_materials[dst].behavior == BEH_LIQUID) {
+    set_cell(nx, ny, src);   // powder sinks
+    set_cell(x, y, dst);     // liquid rises into the vacated cell
+    s_moved[ny * GRID_W + nx] = 1;
+    s_moved[y * GRID_W + x] = 1;
+    return true;
+  }
+  return false;
+}
+
+// Update one grain by its behavior. Powder/liquid fall along gravity with a
+// lateral lean toward the tilt (same forward-slice rule); liquid additionally
+// spreads sideways to level out. Solids never move.
 static void update_grain(int gx, int gy) {
-  if (cell_at(gx, gy) != MAT_SAND) {
+  int idx = gy * GRID_W + gx;
+  if (s_moved[idx]) {
+    return;  // already moved into this cell this frame
+  }
+  uint8_t mv = s_grid[idx];
+  if (mv == MAT_EMPTY) {
+    return;
+  }
+  Behavior beh = s_materials[mv].behavior;
+  if (beh == BEH_SOLID) {
     return;
   }
 
@@ -318,16 +351,14 @@ static void update_grain(int gx, int gy) {
     return;
   }
 
-  // Lateral lean (perpendicular offset): toward the tilt with prob minor/major,
-  // otherwise straight forward.
+  // Lateral lean (perpendicular offset): toward the tilt with prob minor/major.
   int lean = 0;
   if (s_tside != 0 && (int)(xrand() % (uint32_t)s_lean_den) < s_lean_num) {
     lean = s_tside;
   }
 
-  // Attempt order over the three forward-slice cells. When going straight, try a
-  // random side then the other so heaps stay symmetric; when leaning, try the
-  // lean, then straight, then the far side.
+  // Forward-slice attempt order. Going straight: random side then the other so
+  // heaps stay symmetric. Leaning: lean, then straight, then the far side.
   int order[3];
   int cnt = 0;
   order[cnt++] = lean;
@@ -339,15 +370,21 @@ static void update_grain(int gx, int gy) {
     order[cnt++] = 0;
     order[cnt++] = -lean;
   }
-
   for (int i = 0; i < cnt; i++) {
     int p = order[i];
-    int nx = gx + s_fdx + s_pdx * p;
-    int ny = gy + s_fdy + s_pdy * p;
-    if (in_bounds(nx, ny) && cell_at(nx, ny) == MAT_EMPTY) {
-      set_cell(gx, gy, MAT_EMPTY);
-      set_cell(nx, ny, MAT_SAND);
+    if (try_move(gx, gy, gx + s_fdx + s_pdx * p, gy + s_fdy + s_pdy * p, beh)) {
       return;
+    }
+  }
+
+  // Liquid: if it couldn't fall, spread sideways (pure perpendicular) to level.
+  if (beh == BEH_LIQUID) {
+    int s = (xrand() & 1) ? 1 : -1;
+    for (int t = 0; t < 2; t++) {
+      int dir = (t == 0) ? s : -s;
+      if (try_move(gx, gy, gx + s_pdx * dir, gy + s_pdy * dir, beh)) {
+        return;
+      }
     }
   }
 }
@@ -358,8 +395,9 @@ static void update_grain(int gx, int gy) {
 // columns alternate for symmetry); horizontal-dominant swaps the nesting.
 static void sim_step(void) {
   if (s_move_p256 == 0) {
-    return;  // flat: everything rests
+    return;  // flat / gravity off: everything rests
   }
+  memset(s_moved, 0, sizeof(s_moved));
   bool flip = (s_frame & 1);
 
   if (s_fdy != 0) {
@@ -393,7 +431,10 @@ static void menu_label_for(char *buf, size_t n, MenuState menu, int cat) {
     return;
   }
   switch (cat) {
-    case CAT_COLOR:   snprintf(buf, n, "%s", PALETTE_NAMES[s_palette]); break;
+    case CAT_MATERIAL:
+      if (s_brush_mat == 0) snprintf(buf, n, "Eraser");
+      else snprintf(buf, n, "%s", s_materials[s_brush_mat].name);
+      break;
     case CAT_SIZE:    snprintf(buf, n, "%d", s_brush_r); break;
     case CAT_GRAVITY: snprintf(buf, n, "%s", s_gravity_on ? "On" : "Off"); break;
     case CAT_CLEAR:   snprintf(buf, n, "Confirm?"); break;
@@ -562,10 +603,11 @@ static void menu_slide(MenuState from_m, int from_c, MenuState to_m, int to_c, i
 // Change the focused category's value (dir is +1/-1) and apply it live.
 static void menu_adjust(int dir) {
   switch (s_cat) {
-    case CAT_COLOR:
-      s_palette = (s_palette + dir + NUM_PALETTES) % NUM_PALETTES;
-      set_palette(s_palette);
+    case CAT_MATERIAL: {
+      int opts = s_material_count + 1;  // Eraser (0) + materials 1..count
+      s_brush_mat = (s_brush_mat + dir + opts) % opts;
       break;
+    }
     case CAT_SIZE:
       s_brush_r += dir;
       if (s_brush_r < BRUSH_MIN) s_brush_r = BRUSH_MAX;
@@ -680,7 +722,7 @@ static void accel_handler(AccelData *data, uint32_t num_samples) {
 }
 
 static void init(void) {
-  set_palette(s_palette);
+  build_visuals();
 
   // Continuously sample the accelerometer for low-latency tilt response. The
   // handler keeps the latest reading; update_gravity reads it each frame.
