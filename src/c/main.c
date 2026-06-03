@@ -8,7 +8,7 @@
 //   - Tilt gravity: the accelerometer steers which way "down" is.
 //   - Rendered by writing the captured framebuffer directly (fast path).
 //   - Select opens a two-level menu (Material / Tool / Size / Gravity / Bounds /
-//     Clear); values apply live, Back ascends the tree and finally exits.
+//     Clear); Select commits the edited value, Back ascends/cancels and exits.
 
 #include <pebble.h>
 
@@ -148,7 +148,7 @@ static bool s_bounds_on = true;       // false lets material flow off-screen
 
 // --- Menu --------------------------------------------------------------------
 // Two-level menu over a black bar. Select descends (canvas -> categories ->
-// values); Back ascends and finally exits. Values apply live as you cycle them.
+// values) and commits the edited value; Back ascends/cancels and finally exits.
 typedef enum { MENU_CLOSED, MENU_L1, MENU_L2 } MenuState;
 static MenuState s_menu = MENU_CLOSED;
 
@@ -159,6 +159,7 @@ static const char *CAT_NAMES[NUM_CATS] = {
   "Material", "Tool", "Size", "Gravity", "Bounds", "Clear"
 };
 static int s_cat = 0;                 // selected category at level 1
+static int s_pending = 0;             // value being edited at L2 (Select commits)
 
 // Affordance arrows (filled triangles): up/down = options cycle (Up/Down),
 // right = Select/descend, left = Back/ascend. Built at window load.
@@ -522,12 +523,13 @@ static void menu_label_for(char *buf, size_t n, MenuState menu, int cat) {
     snprintf(buf, n, "%s", CAT_NAMES[cat]);
     return;
   }
+  // L2 shows the pending (in-edit) value, not the committed one.
   switch (cat) {
-    case CAT_MATERIAL: snprintf(buf, n, "%s", s_materials[s_brush_mat].name); break;
-    case CAT_TOOL:     snprintf(buf, n, "%s", TOOL_NAMES[s_tool]); break;
-    case CAT_SIZE:     snprintf(buf, n, "%d", s_brush_r); break;
-    case CAT_GRAVITY:  snprintf(buf, n, "%s", s_gravity_on ? "On" : "Off"); break;
-    case CAT_BOUNDS:   snprintf(buf, n, "%s", s_bounds_on ? "On" : "Off"); break;
+    case CAT_MATERIAL: snprintf(buf, n, "%s", s_materials[s_pending].name); break;
+    case CAT_TOOL:     snprintf(buf, n, "%s", TOOL_NAMES[s_pending]); break;
+    case CAT_SIZE:     snprintf(buf, n, "%d", s_pending); break;
+    case CAT_GRAVITY:  snprintf(buf, n, "%s", s_pending ? "On" : "Off"); break;
+    case CAT_BOUNDS:   snprintf(buf, n, "%s", s_pending ? "On" : "Off"); break;
     case CAT_CLEAR:    snprintf(buf, n, "Confirm?"); break;
     default:           buf[0] = '\0'; break;
   }
@@ -700,26 +702,48 @@ static void menu_slide(MenuState from_m, int from_c, MenuState to_m, int to_c, i
   s_anim_active = true;
 }
 
-// Change the focused category's value (dir is +1/-1) and apply it live.
+// The committed value of a category (read when opening its editor).
+static int cat_value(int cat) {
+  switch (cat) {
+    case CAT_MATERIAL: return s_brush_mat;
+    case CAT_TOOL:     return s_tool;
+    case CAT_SIZE:     return s_brush_r;
+    case CAT_GRAVITY:  return s_gravity_on;
+    case CAT_BOUNDS:   return s_bounds_on;
+    default:           return 0;
+  }
+}
+
+// Apply a category's value (called when Select commits the pending edit).
+static void cat_commit(int cat, int v) {
+  switch (cat) {
+    case CAT_MATERIAL: s_brush_mat = v; break;
+    case CAT_TOOL:     s_tool = v; break;
+    case CAT_SIZE:     s_brush_r = v; break;
+    case CAT_GRAVITY:  s_gravity_on = v; break;
+    case CAT_BOUNDS:   s_bounds_on = v; break;
+    default: break;  // CAT_CLEAR has no value
+  }
+}
+
+// Cycle the pending value for the focused category (dir +1/-1). Not applied
+// until Select commits it.
 static void menu_adjust(int dir) {
   switch (s_cat) {
-    case CAT_MATERIAL:
-      // Materials are indices 1..count; cycle within that range.
-      s_brush_mat = (s_brush_mat - 1 + dir + s_material_count) % s_material_count + 1;
+    case CAT_MATERIAL:  // material indices 1..count
+      s_pending = (s_pending - 1 + dir + s_material_count) % s_material_count + 1;
       break;
     case CAT_TOOL:
-      s_tool = (s_tool + dir + NUM_TOOLS) % NUM_TOOLS;
+      s_pending = (s_pending + dir + NUM_TOOLS) % NUM_TOOLS;
       break;
     case CAT_SIZE:
-      s_brush_r += dir;
-      if (s_brush_r < BRUSH_MIN) s_brush_r = BRUSH_MAX;
-      if (s_brush_r > BRUSH_MAX) s_brush_r = BRUSH_MIN;
+      s_pending += dir;
+      if (s_pending < BRUSH_MIN) s_pending = BRUSH_MAX;
+      if (s_pending > BRUSH_MAX) s_pending = BRUSH_MIN;
       break;
     case CAT_GRAVITY:
-      s_gravity_on = !s_gravity_on;  // two states: either direction toggles
-      break;
     case CAT_BOUNDS:
-      s_bounds_on = !s_bounds_on;
+      s_pending = !s_pending;  // two states: either direction toggles
       break;
     case CAT_CLEAR:
       break;  // no value; Select performs the clear
@@ -756,12 +780,15 @@ static void select_click(ClickRecognizerRef recognizer, void *context) {
       s_menu = MENU_L1;
       break;
     case MENU_L1:
+      s_pending = cat_value(s_cat);  // start editing from the committed value
       menu_slide(MENU_L1, s_cat, MENU_L2, s_cat, +1);
       s_menu = MENU_L2;
       break;
     case MENU_L2:
       if (s_cat == CAT_CLEAR) {
         clear_grid();
+      } else {
+        cat_commit(s_cat, s_pending);  // apply the pending value now
       }
       s_menu = MENU_CLOSED;  // closing is instant
       s_anim_active = false;
