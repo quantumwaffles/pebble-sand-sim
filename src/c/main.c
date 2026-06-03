@@ -404,7 +404,9 @@ static void menu_label_for(char *buf, size_t n, MenuState menu, int cat) {
 // Draw a menu label centered in a full-width rect shifted by x_off (for slides).
 static void menu_draw_label(GContext *ctx, const char *text, int x_off, int by, int bh, int w) {
   GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
-  GRect tr = GRect(x_off, by + (bh - 26) / 2, w, 26);
+  // -4 compensates for the font's ascent padding so the glyphs sit optically
+  // centered between the up/down arrows (the text box itself is centered).
+  GRect tr = GRect(x_off, by + (bh - 26) / 2 - 4, w, 26);
   graphics_draw_text(ctx, text, font, tr, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 }
 
