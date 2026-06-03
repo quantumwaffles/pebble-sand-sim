@@ -7,8 +7,9 @@
 //   - Touch (Emery): tap or drag to paint the selected material; Eraser removes.
 //   - Tilt gravity: the accelerometer steers which way "down" is.
 //   - Rendered by writing the captured framebuffer directly (fast path).
-//   - Select opens a two-level menu (Material / Tool / Size / Gravity / Bounds /
-//     Clear); Select commits the edited value, Back ascends/cancels and exits.
+//   - Select opens an N-level menu (Material / Tool / Size / Gravity / Bounds /
+//     Clear, with submenus like Gravity > Static > direction). Select descends
+//     or commits a leaf; Back ascends/cancels and finally exits.
 
 #include <pebble.h>
 
@@ -159,19 +160,32 @@ static int  s_gravity_mode = GMODE_SENSOR;
 static bool s_bounds_on = true;       // false lets material flow off-screen
 
 // --- Menu --------------------------------------------------------------------
-// Two-level menu over a black bar. Select descends (canvas -> categories ->
-// values) and commits the edited value; Back ascends/cancels and finally exits.
-typedef enum { MENU_CLOSED, MENU_L1, MENU_L2 } MenuState;
-static MenuState s_menu = MENU_CLOSED;
+// N-level menu over a black bar, shown one item at a time. Each screen is a
+// "node" (a list of items); Up/Down pick an item, Select descends into a child
+// node or commits a leaf value, Back ascends one level (and finally exits). A
+// nav stack of (node, selected index) tracks the path so Back can restore it.
+typedef enum {
+  NODE_ROOT, NODE_MATERIAL, NODE_TOOL, NODE_SIZE,
+  NODE_GRAVITY, NODE_GRAVDIR, NODE_BOUNDS, NODE_CLEAR
+} MenuNode;
 
+// Root items (also the category names).
 typedef enum {
   CAT_MATERIAL, CAT_TOOL, CAT_SIZE, CAT_GRAVITY, CAT_BOUNDS, CAT_CLEAR, NUM_CATS
 } MenuCat;
 static const char *CAT_NAMES[NUM_CATS] = {
   "Material", "Tool", "Size", "Gravity", "Bounds", "Clear"
 };
-static int s_cat = 0;                 // selected category at level 1
-static int s_pending = 0;             // value being edited at L2 (Select commits)
+
+// Static-gravity directions (the NODE_GRAVDIR submenu). Index -> screen dir.
+static const char *DIR_NAMES[4] = { "Down", "Up", "Left", "Right" };
+static int s_static_dir = 0;          // committed Static direction (default Down)
+
+#define MENU_MAX_DEPTH 4
+static int s_nav_node[MENU_MAX_DEPTH];
+static int s_nav_sel[MENU_MAX_DEPTH];
+static int s_nav_depth = 0;           // 0 = closed; current level = depth - 1
+static int s_root_sel = 0;            // remembered Root selection across opens
 
 // Affordance arrows (filled triangles): up/down = options cycle (Up/Down),
 // right = Select/descend, left = Back/ascend. Built at window load.
@@ -348,7 +362,14 @@ static void update_gravity(void) {
   switch (s_gravity_mode) {
     case GMODE_SENSOR: gx = s_accel_x; gy = -s_accel_y; break;
     case GMODE_OFF:    break;                       // no gravity (freeze)
-    case GMODE_STATIC: gy = G_FULL; break;          // always down
+    case GMODE_STATIC:                              // fixed direction
+      switch (s_static_dir) {
+        case 0: gy =  G_FULL; break;  // Down
+        case 1: gy = -G_FULL; break;  // Up
+        case 2: gx = -G_FULL; break;  // Left
+        case 3: gx =  G_FULL; break;  // Right
+      }
+      break;
     case GMODE_CENTER: s_grav_center = true; break; // toward center, per-cell
   }
   s_grav_x = gx;
@@ -548,22 +569,57 @@ static void sim_step(void) {
 }
 
 // --- Menu helpers ------------------------------------------------------------
-// Format the label shown for a given menu level + category (values read live).
-static void menu_label_for(char *buf, size_t n, MenuState menu, int cat) {
-  if (menu == MENU_L1) {
-    snprintf(buf, n, "%s", CAT_NAMES[cat]);
-    return;
+// Number of items in a node.
+static int node_count(int node) {
+  switch (node) {
+    case NODE_ROOT:     return NUM_CATS;
+    case NODE_MATERIAL: return s_material_count;
+    case NODE_TOOL:     return NUM_TOOLS;
+    case NODE_SIZE:     return BRUSH_MAX - BRUSH_MIN + 1;
+    case NODE_GRAVITY:  return NUM_GMODES;
+    case NODE_GRAVDIR:  return 4;
+    case NODE_BOUNDS:   return 2;
+    case NODE_CLEAR:    return 1;
   }
-  // L2 shows the pending (in-edit) value, not the committed one.
-  switch (cat) {
-    case CAT_MATERIAL: snprintf(buf, n, "%s", s_materials[s_pending].name); break;
-    case CAT_TOOL:     snprintf(buf, n, "%s", TOOL_NAMES[s_pending]); break;
-    case CAT_SIZE:     snprintf(buf, n, "%d", s_pending); break;
-    case CAT_GRAVITY:  snprintf(buf, n, "%s", GMODE_NAMES[s_pending]); break;
-    case CAT_BOUNDS:   snprintf(buf, n, "%s", s_pending ? "On" : "Off"); break;
-    case CAT_CLEAR:    snprintf(buf, n, "Confirm?"); break;
-    default:           buf[0] = '\0'; break;
+  return 1;
+}
+
+// Label for item `sel` of a node.
+static void node_label(int node, int sel, char *buf, size_t n) {
+  switch (node) {
+    case NODE_ROOT:     snprintf(buf, n, "%s", CAT_NAMES[sel]); break;
+    case NODE_MATERIAL: snprintf(buf, n, "%s", s_materials[sel + 1].name); break;
+    case NODE_TOOL:     snprintf(buf, n, "%s", TOOL_NAMES[sel]); break;
+    case NODE_SIZE:     snprintf(buf, n, "%d", BRUSH_MIN + sel); break;
+    case NODE_GRAVITY:  snprintf(buf, n, "%s", GMODE_NAMES[sel]); break;
+    case NODE_GRAVDIR:  snprintf(buf, n, "%s", DIR_NAMES[sel]); break;
+    case NODE_BOUNDS:   snprintf(buf, n, "%s", sel ? "On" : "Off"); break;
+    case NODE_CLEAR:    snprintf(buf, n, "Confirm?"); break;
+    default:            buf[0] = '\0'; break;
   }
+}
+
+// Does selecting this item descend into a child node (vs commit a leaf)?
+static bool node_item_descends(int node, int sel) {
+  if (node == NODE_ROOT) return true;
+  if (node == NODE_GRAVITY && sel == GMODE_STATIC) return true;
+  return false;
+}
+
+// Initial selection when entering a node: the committed value (so the editor
+// opens on the current setting).
+static int node_init_sel(int node) {
+  switch (node) {
+    case NODE_ROOT:     return s_root_sel;
+    case NODE_MATERIAL: return s_brush_mat - 1;
+    case NODE_TOOL:     return s_tool;
+    case NODE_SIZE:     return s_brush_r - BRUSH_MIN;
+    case NODE_GRAVITY:  return s_gravity_mode;
+    case NODE_GRAVDIR:  return s_static_dir;
+    case NODE_BOUNDS:   return s_bounds_on;
+    case NODE_CLEAR:    return 0;
+  }
+  return 0;
 }
 
 // Draw a menu label centered in a full-width rect shifted by x_off (for slides).
@@ -607,7 +663,9 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
 
   // Menu overlay: a full-width black bar centered vertically with white text
   // and affordance arrows.
-  if (s_menu != MENU_CLOSED) {
+  if (s_nav_depth > 0) {
+    int node = s_nav_node[s_nav_depth - 1];
+    int sel = s_nav_sel[s_nav_depth - 1];
     const int bh = 64;
     int by = (bounds.size.h - bh) / 2;
     int cx = bounds.size.w / 2;
@@ -621,12 +679,12 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
     graphics_draw_line(ctx, GPoint(0, by), GPoint(w, by));
     graphics_draw_line(ctx, GPoint(0, by + bh - 1), GPoint(w, by + bh - 1));
 
-    // Label(s): one centered label normally; during a level transition, the old
-    // label slides out and the new one slides in (ease-out).
+    // Label(s): one centered label normally; during a transition, the old label
+    // slides out and the new one slides in (ease-out).
     graphics_context_set_text_color(ctx, GColorWhite);
     if (!s_anim_active) {
       char buf[24];
-      menu_label_for(buf, sizeof(buf), s_menu, s_cat);
+      node_label(node, sel, buf, sizeof(buf));
       menu_draw_label(ctx, buf, 0, by, bh, w);
     } else {
       int q = MENU_ANIM_FRAMES - s_anim_t;            // frames remaining
@@ -636,17 +694,16 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
       menu_draw_label(ctx, s_anim_to,    s_anim_dir * rem_w,   by, bh, w);
     }
 
-    // Arrows on top so they stay crisp over any sliding text. Left (Back) and
-    // right (Select) always apply; up/down only when there are options to cycle.
+    // Arrows on top so they stay crisp over any sliding text. Left (Back) always
+    // applies; right is an arrow if Select descends, else a checkmark (commit);
+    // up/down only when there is more than one item to cycle.
     graphics_context_set_fill_color(ctx, GColorWhite);
     gpath_move_to(s_arrow_left, GPoint(13, cy));
     gpath_draw_filled(ctx, s_arrow_left);
-    if (s_menu == MENU_L1) {
-      // Right arrow: Select descends into the values.
+    if (node_item_descends(node, sel)) {
       gpath_move_to(s_arrow_right, GPoint(w - 13, cy));
       gpath_draw_filled(ctx, s_arrow_right);
     } else {
-      // Checkmark: at L2 Select confirms/closes (no deeper level).
       int bx = w - 18;
       graphics_context_set_stroke_color(ctx, GColorWhite);
       graphics_context_set_stroke_width(ctx, 3);
@@ -654,8 +711,7 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
       graphics_draw_line(ctx, GPoint(bx + 4, cy + 5), GPoint(bx + 11, cy - 5));
       graphics_context_set_stroke_width(ctx, 1);
     }
-    bool cyclable = (s_menu == MENU_L1) || (s_cat != CAT_CLEAR);
-    if (cyclable) {
+    if (node_count(node) > 1) {
       gpath_move_to(s_arrow_up, GPoint(cx, by + 12));
       gpath_draw_filled(ctx, s_arrow_up);
       gpath_move_to(s_arrow_down, GPoint(cx, by + bh - 12));
@@ -688,7 +744,7 @@ static void timer_cb(void *data) {
 // the timer loop keeps painting each frame while the finger stays down/drags.
 static void touch_handler(const TouchEvent *event, void *context) {
   (void)context;
-  if (s_menu != MENU_CLOSED) {
+  if (s_nav_depth > 0) {
     s_touch_active = false;  // menu is modal: ignore painting while it's open
     return;
   }
@@ -720,129 +776,107 @@ static void clear_grid(void) {
   memset(s_grid, MAT_EMPTY, sizeof(s_grid));
 }
 
-// Start a horizontal slide between two menu labels. A MENU_CLOSED endpoint maps
-// to an empty label so opening slides the first label in (and nothing slides on
-// a plain open). dir +1 descends, -1 ascends.
-static void menu_slide(MenuState from_m, int from_c, MenuState to_m, int to_c, int dir) {
-  menu_label_for(s_anim_from, sizeof(s_anim_from), from_m, from_c);
-  menu_label_for(s_anim_to, sizeof(s_anim_to), to_m, to_c);
-  if (from_m == MENU_CLOSED) s_anim_from[0] = '\0';
-  if (to_m == MENU_CLOSED) s_anim_to[0] = '\0';
+// Start a horizontal slide between two node labels. from_node < 0 means empty
+// (opening). dir +1 descends, -1 ascends.
+static void menu_slide(int from_node, int from_sel, int to_node, int to_sel, int dir) {
+  if (from_node < 0) s_anim_from[0] = '\0';
+  else node_label(from_node, from_sel, s_anim_from, sizeof(s_anim_from));
+  if (to_node < 0) s_anim_to[0] = '\0';
+  else node_label(to_node, to_sel, s_anim_to, sizeof(s_anim_to));
   s_anim_dir = dir;
   s_anim_t = 0;
   s_anim_active = true;
 }
 
-// The committed value of a category (read when opening its editor).
-static int cat_value(int cat) {
-  switch (cat) {
-    case CAT_MATERIAL: return s_brush_mat;
-    case CAT_TOOL:     return s_tool;
-    case CAT_SIZE:     return s_brush_r;
-    case CAT_GRAVITY:  return s_gravity_mode;
-    case CAT_BOUNDS:   return s_bounds_on;
-    default:           return 0;
+// Child node reached by descending into item `sel` of a node.
+static int node_child(int node, int sel) {
+  if (node == NODE_ROOT) {
+    switch (sel) {
+      case CAT_MATERIAL: return NODE_MATERIAL;
+      case CAT_TOOL:     return NODE_TOOL;
+      case CAT_SIZE:     return NODE_SIZE;
+      case CAT_GRAVITY:  return NODE_GRAVITY;
+      case CAT_BOUNDS:   return NODE_BOUNDS;
+      case CAT_CLEAR:    return NODE_CLEAR;
+    }
+  }
+  if (node == NODE_GRAVITY && sel == GMODE_STATIC) return NODE_GRAVDIR;
+  return NODE_ROOT;
+}
+
+// Commit a leaf node's selected value (or run its action).
+static void node_commit(int node, int sel) {
+  switch (node) {
+    case NODE_MATERIAL: s_brush_mat = sel + 1; break;
+    case NODE_TOOL:     s_tool = sel; break;
+    case NODE_SIZE:     s_brush_r = BRUSH_MIN + sel; break;
+    case NODE_GRAVITY:  s_gravity_mode = sel; break;  // Static descends, not here
+    case NODE_GRAVDIR:  s_gravity_mode = GMODE_STATIC; s_static_dir = sel; break;
+    case NODE_BOUNDS:   s_bounds_on = sel; break;
+    case NODE_CLEAR:    clear_grid(); break;
+    default: break;
   }
 }
 
-// Apply a category's value (called when Select commits the pending edit).
-static void cat_commit(int cat, int v) {
-  switch (cat) {
-    case CAT_MATERIAL: s_brush_mat = v; break;
-    case CAT_TOOL:     s_tool = v; break;
-    case CAT_SIZE:     s_brush_r = v; break;
-    case CAT_GRAVITY:  s_gravity_mode = v; break;
-    case CAT_BOUNDS:   s_bounds_on = v; break;
-    default: break;  // CAT_CLEAR has no value
-  }
-}
-
-// Cycle the pending value for the focused category (dir +1/-1). Not applied
-// until Select commits it.
-static void menu_adjust(int dir) {
-  switch (s_cat) {
-    case CAT_MATERIAL:  // material indices 1..count
-      s_pending = (s_pending - 1 + dir + s_material_count) % s_material_count + 1;
-      break;
-    case CAT_TOOL:
-      s_pending = (s_pending + dir + NUM_TOOLS) % NUM_TOOLS;
-      break;
-    case CAT_SIZE:
-      s_pending += dir;
-      if (s_pending < BRUSH_MIN) s_pending = BRUSH_MAX;
-      if (s_pending > BRUSH_MAX) s_pending = BRUSH_MIN;
-      break;
-    case CAT_GRAVITY:
-      s_pending = (s_pending + dir + NUM_GMODES) % NUM_GMODES;
-      break;
-    case CAT_BOUNDS:
-      s_pending = !s_pending;  // two states: either direction toggles
-      break;
-    case CAT_CLEAR:
-      break;  // no value; Select performs the clear
-  }
-}
-
-static void up_click(ClickRecognizerRef recognizer, void *context) {
+static void nav_cycle(int dir) {
+  if (s_nav_depth == 0) return;
   s_anim_active = false;  // cycling is instant; don't fight a level slide
-  if (s_menu == MENU_L1) {
-    s_cat = (s_cat - 1 + NUM_CATS) % NUM_CATS;
-  } else if (s_menu == MENU_L2) {
-    menu_adjust(+1);
-  }
+  int d = s_nav_depth - 1;
+  int c = node_count(s_nav_node[d]);
+  s_nav_sel[d] = (s_nav_sel[d] + dir + c) % c;
 }
 
-static void down_click(ClickRecognizerRef recognizer, void *context) {
-  s_anim_active = false;
-  if (s_menu == MENU_L1) {
-    s_cat = (s_cat + 1) % NUM_CATS;
-  } else if (s_menu == MENU_L2) {
-    menu_adjust(-1);
-  }
-}
+static void up_click(ClickRecognizerRef recognizer, void *context) { nav_cycle(-1); }
+static void down_click(ClickRecognizerRef recognizer, void *context) { nav_cycle(+1); }
 
-// Select descends: canvas -> categories -> values. At a value, Select closes the
-// menu (values already applied live); for Clear it performs the wipe first.
+// Select: open the menu from the canvas, descend into a child node, or commit a
+// leaf value (closing the menu).
 static void select_click(ClickRecognizerRef recognizer, void *context) {
-  switch (s_menu) {
-    case MENU_CLOSED:
+  if (s_nav_depth == 0) {
 #if defined(PBL_TOUCH)
-      s_touch_active = false;  // stop any in-progress painting as we open
+    s_touch_active = false;  // stop any in-progress painting as we open
 #endif
-      menu_slide(MENU_CLOSED, s_cat, MENU_L1, s_cat, +1);
-      s_menu = MENU_L1;
-      break;
-    case MENU_L1:
-      s_pending = cat_value(s_cat);  // start editing from the committed value
-      menu_slide(MENU_L1, s_cat, MENU_L2, s_cat, +1);
-      s_menu = MENU_L2;
-      break;
-    case MENU_L2:
-      if (s_cat == CAT_CLEAR) {
-        clear_grid();
-      } else {
-        cat_commit(s_cat, s_pending);  // apply the pending value now
-      }
-      s_menu = MENU_CLOSED;  // closing is instant
-      s_anim_active = false;
-      break;
+    s_nav_node[0] = NODE_ROOT;
+    s_nav_sel[0] = s_root_sel;
+    menu_slide(-1, 0, NODE_ROOT, s_root_sel, +1);
+    s_nav_depth = 1;
+    return;
+  }
+
+  int d = s_nav_depth - 1;
+  int node = s_nav_node[d], sel = s_nav_sel[d];
+  if (node_item_descends(node, sel)) {
+    if (s_nav_depth < MENU_MAX_DEPTH) {
+      int child = node_child(node, sel);
+      int csel = node_init_sel(child);
+      menu_slide(node, sel, child, csel, +1);
+      s_nav_node[s_nav_depth] = child;
+      s_nav_sel[s_nav_depth] = csel;
+      s_nav_depth++;
+    }
+  } else {
+    node_commit(node, sel);
+    s_root_sel = s_nav_sel[0];  // remember the category for next open
+    s_nav_depth = 0;            // close (instant)
+    s_anim_active = false;
   }
 }
 
-// Back ascends the menu tree; at the top it falls through to exit the app.
+// Back ascends one level; at the root it closes to the canvas; on the canvas it
+// exits the app.
 static void back_click(ClickRecognizerRef recognizer, void *context) {
-  switch (s_menu) {
-    case MENU_L2:
-      menu_slide(MENU_L2, s_cat, MENU_L1, s_cat, -1);
-      s_menu = MENU_L1;
-      break;
-    case MENU_L1:
-      s_menu = MENU_CLOSED;  // closing is instant
-      s_anim_active = false;
-      break;
-    case MENU_CLOSED:
-      window_stack_pop(true);  // exit the app, as Back normally would
-      break;
+  if (s_nav_depth == 0) {
+    window_stack_pop(true);  // exit the app, as Back normally would
+    return;
+  }
+  if (s_nav_depth > 1) {
+    int d = s_nav_depth - 1;
+    menu_slide(s_nav_node[d], s_nav_sel[d], s_nav_node[d - 1], s_nav_sel[d - 1], -1);
+    s_nav_depth--;
+  } else {
+    s_root_sel = s_nav_sel[0];
+    s_nav_depth = 0;  // close to canvas (instant)
+    s_anim_active = false;
   }
 }
 
