@@ -22,10 +22,12 @@
 // Paint brush radius, in cells (a filled disc ~5 cells across).
 #define BRUSH_R 2
 
-// Tilt gravity: ignore in-plane tilt weaker than this (milli-g) so a near-flat
-// watch (gravity mostly into the screen) keeps its last direction instead of
-// jittering between axes.
-#define GRAV_DEADZONE 200
+// Tilt gravity speed: the sand feels the in-plane projection of gravity (what's
+// left after the component pointing into the glass). Its magnitude sets how
+// often a grain moves, in milli-g: at/above G_FULL grains fall every frame; at
+// or below G_MIN (watch near-flat) they rest entirely.
+#define G_FULL 1000
+#define G_MIN  120
 
 // --- Timing ------------------------------------------------------------------
 #define FRAME_MS 33                // ~30 fps
@@ -39,10 +41,19 @@ static uint8_t s_grid[GRID_W * GRID_H];
 
 static uint32_t s_frame;
 
-// Current gravity as a cardinal unit vector in screen space (x right, y down).
-// Defaults to straight down; updated each frame from the accelerometer.
-static int s_gdx = 0;
-static int s_gdy = 1;
+// Gravity for this frame, derived from the accelerometer. Defaults to full-speed
+// straight down. A grain moves one step "forward" (the dominant cardinal axis)
+// plus an optional lateral step toward the tilt:
+//   - (s_fdx,s_fdy)  forward: the dominant cardinal direction.
+//   - (s_pdx,s_pdy)  perpendicular unit (the lateral axis).
+//   - s_tside        which lateral way the tilt leans (-1/0/+1).
+//   - s_lean_num/den  P(take the lateral step) = num/den (how diagonal the tilt).
+//   - s_move_p256    P(grain moves at all this frame) * 256 (gravity magnitude).
+static int s_fdx = 0, s_fdy = 1;
+static int s_pdx = 1, s_pdy = 0;
+static int s_tside = 0;
+static int s_lean_num = 0, s_lean_den = 1;
+static int s_move_p256 = 256;
 
 #if defined(PBL_TOUCH)
 // Touch state: grid cell under the finger, active while a finger is down.
@@ -120,93 +131,94 @@ static void paint_brush(int cx, int cy) {
   }
 }
 
-// The 8 neighbor directions, ordered clockwise around the compass so that two
-// entries one apart are 45 deg apart. Gravity points at one of these; a grain's
-// two slide fallbacks are its +/-45 deg ring-neighbors.
-static const int8_t RING[8][2] = {
-  { 0,  1},  // 0: down
-  { 1,  1},  // 1: down-right
-  { 1,  0},  // 2: right
-  { 1, -1},  // 3: up-right
-  { 0, -1},  // 4: up
-  {-1, -1},  // 5: up-left
-  {-1,  0},  // 6: left
-  {-1,  1},  // 7: down-left
-};
-
-static int ring_index(int dx, int dy) {
-  for (int i = 0; i < 8; i++) {
-    if (RING[i][0] == dx && RING[i][1] == dy) {
-      return i;
-    }
-  }
-  return 0;
-}
-
-// Pick this frame's gravity direction from the accelerometer with probabilistic
-// blending, so the time-averaged flow tracks the exact tilt angle (analog feel)
-// while each frame still uses one discrete ring direction (keeps the sim_step
-// scan order correct). Mapping (from the fluid-sim, tested): screen-right = a.x,
-// down = -a.y. Any in-plane tilt sits between the dominant cardinal direction
-// and the quadrant diagonal; we pick the diagonal with probability minor/major
-// (how diagonal the tilt is) and the cardinal otherwise. Within the deadzone
-// (watch near-flat) we keep the previous direction.
+// Read the accelerometer and derive this frame's gravity. Mapping (from the
+// fluid-sim, tested): screen-right = a.x, down = -a.y. The dominant axis is the
+// "forward" fall direction; the smaller component leans the fall toward the tilt
+// (lean probability = minor/major, so the time-averaged flow tracks the exact
+// angle). The in-plane magnitude sets the per-frame move probability, so a
+// shallow tilt creeps, a steep tilt pours, and a flat watch rests.
 static void update_gravity(void) {
   AccelData a;
   if (accel_service_peek(&a) < 0) {
-    return;  // sensor busy this frame; keep last direction
+    return;  // sensor busy this frame; keep last gravity
   }
   int gx = a.x;    // gravity component toward screen-right
   int gy = -a.y;   // gravity component toward screen-down
   int ax = gx < 0 ? -gx : gx;
   int ay = gy < 0 ? -gy : gy;
-  int major = ax > ay ? ax : ay;
-  int minor = ax > ay ? ay : ax;
-  if (major < GRAV_DEADZONE) {
-    return;  // too flat to tell which way is down; keep last direction
-  }
-
   int sx = gx > 0 ? 1 : (gx < 0 ? -1 : 0);
   int sy = gy > 0 ? 1 : (gy < 0 ? -1 : 0);
 
-  if ((int)(xrand() % (uint32_t)major) < minor) {
-    // Diagonal: chosen more often the more diagonal the tilt is.
-    s_gdx = sx;
-    s_gdy = sy;
-  } else if (ax >= ay) {
-    s_gdx = sx;  // dominant cardinal is horizontal
-    s_gdy = 0;
+  int major, minor;
+  if (ax >= ay) {
+    // Horizontal dominant: fall sideways, lean up/down toward the tilt.
+    s_fdx = sx; s_fdy = 0;
+    s_pdx = 0;  s_pdy = 1;
+    s_tside = sy;
+    major = ax; minor = ay;
   } else {
-    s_gdx = 0;   // dominant cardinal is vertical
-    s_gdy = sy;
+    // Vertical dominant: fall down/up, lean left/right toward the tilt.
+    s_fdx = 0;  s_fdy = sy;
+    s_pdx = 1;  s_pdy = 0;
+    s_tside = sx;
+    major = ay; minor = ax;
+  }
+  s_lean_num = minor;
+  s_lean_den = major > 0 ? major : 1;
+
+  // In-plane magnitude ~= |(gx,gy)| via alpha-max-plus-beta-min (sqrt-free),
+  // mapped to a 0..256 per-frame move probability.
+  int m = major + (minor * 7) / 16;
+  if (m <= G_MIN) {
+    s_move_p256 = 0;
+  } else if (m >= G_FULL) {
+    s_move_p256 = 256;
+  } else {
+    s_move_p256 = (m - G_MIN) * 256 / (G_FULL - G_MIN);
   }
 }
 
-// Move one grain: try straight "forward" (along gravity), then the two slide
-// fallbacks (forward's +/-45 deg ring-neighbors) in a randomized order.
-static void update_grain(int gx, int gy,
-                         int fdx, int fdy,
-                         int adx, int ady,
-                         int bdx, int bdy) {
+// Move one grain. First gate on gravity magnitude (it may rest this frame), then
+// pick a lateral lean toward the tilt and try the forward cell at that lean,
+// falling back through the other forward-slice cells so piles still spread. All
+// candidates lie one step forward along the dominant axis, which keeps the
+// sim_step scan order correct (no grain moves twice per frame).
+static void update_grain(int gx, int gy) {
   if (cell_at(gx, gy) != MAT_SAND) {
     return;
   }
 
-  // 1. Straight along gravity.
-  if (in_bounds(gx + fdx, gy + fdy) && cell_at(gx + fdx, gy + fdy) == MAT_EMPTY) {
-    set_cell(gx, gy, MAT_EMPTY);
-    set_cell(gx + fdx, gy + fdy, MAT_SAND);
+  // Gravity-magnitude gate: maybe rest this frame.
+  if (s_move_p256 < 256 && (int)(xrand() & 255) >= s_move_p256) {
     return;
   }
 
-  // 2/3. The two slide fallbacks, in a random order.
-  int ox[2] = { adx, bdx };
-  int oy[2] = { ady, bdy };
-  int first = xrand() & 1;
-  for (int t = 0; t < 2; t++) {
-    int k = first ? t : (1 - t);
-    int nx = gx + ox[k];
-    int ny = gy + oy[k];
+  // Lateral lean (perpendicular offset): toward the tilt with prob minor/major,
+  // otherwise straight forward.
+  int lean = 0;
+  if (s_tside != 0 && (int)(xrand() % (uint32_t)s_lean_den) < s_lean_num) {
+    lean = s_tside;
+  }
+
+  // Attempt order over the three forward-slice cells. When going straight, try a
+  // random side then the other so heaps stay symmetric; when leaning, try the
+  // lean, then straight, then the far side.
+  int order[3];
+  int cnt = 0;
+  order[cnt++] = lean;
+  if (lean == 0) {
+    int s = (xrand() & 1) ? 1 : -1;
+    order[cnt++] = s;
+    order[cnt++] = -s;
+  } else {
+    order[cnt++] = 0;
+    order[cnt++] = -lean;
+  }
+
+  for (int i = 0; i < cnt; i++) {
+    int p = order[i];
+    int nx = gx + s_fdx + s_pdx * p;
+    int ny = gy + s_fdy + s_pdy * p;
     if (in_bounds(nx, ny) && cell_at(nx, ny) == MAT_EMPTY) {
       set_cell(gx, gy, MAT_EMPTY);
       set_cell(nx, ny, MAT_SAND);
@@ -215,47 +227,34 @@ static void update_grain(int gx, int gy,
   }
 }
 
-// One CA step under the current (8-way) gravity direction. Every destination a
-// grain can move to lies one step "forward" along gravity, so we must visit
-// cells from the gravity-forward edge backward to avoid moving a grain twice.
-// For vertical/diagonal gravity the outer loop runs over rows (forward edge
-// first) and the inner over x; pure-horizontal gravity swaps the nesting so its
-// forward axis (x) is the outer loop instead.
+// One CA step. Every cell a grain can move to lies one step "forward" along the
+// dominant gravity axis, so we visit cells from the forward edge backward to
+// avoid moving a grain twice. Vertical-dominant gravity loops rows outer (inner
+// columns alternate for symmetry); horizontal-dominant swaps the nesting.
 static void sim_step(void) {
-  int k = ring_index(s_gdx, s_gdy);
-  int fdx = RING[k][0], fdy = RING[k][1];
-  int adx = RING[(k + 1) & 7][0], ady = RING[(k + 1) & 7][1];  // +45 deg
-  int bdx = RING[(k + 7) & 7][0], bdy = RING[(k + 7) & 7][1];  // -45 deg
+  if (s_move_p256 == 0) {
+    return;  // flat: everything rests
+  }
   bool flip = (s_frame & 1);
 
-  if (fdy != 0) {
-    // Vertical or diagonal gravity: outer over rows, inner over columns.
-    int ys = (fdy > 0) ? GRID_H - 1 : 0;
-    int ystep = (fdy > 0) ? -1 : 1;
-    // Columns: forward-first if gravity has an x component, else alternate.
-    int xs, xstep;
-    if (fdx > 0)      { xs = GRID_W - 1; xstep = -1; }
-    else if (fdx < 0) { xs = 0;          xstep = 1;  }
-    else if (flip)    { xs = GRID_W - 1; xstep = -1; }
-    else              { xs = 0;          xstep = 1;  }
+  if (s_fdy != 0) {
+    int ys = (s_fdy > 0) ? GRID_H - 1 : 0;
+    int ystep = (s_fdy > 0) ? -1 : 1;
     for (int n = 0; n < GRID_H; n++) {
       int gy = ys + ystep * n;
       for (int m = 0; m < GRID_W; m++) {
-        int gx = xs + xstep * m;
-        update_grain(gx, gy, fdx, fdy, adx, ady, bdx, bdy);
+        int gx = flip ? (GRID_W - 1 - m) : m;
+        update_grain(gx, gy);
       }
     }
   } else {
-    // Pure horizontal gravity: outer over columns (forward edge first), inner y.
-    int xs = (fdx > 0) ? GRID_W - 1 : 0;
-    int xstep = (fdx > 0) ? -1 : 1;
-    int ys = flip ? GRID_H - 1 : 0;
-    int ystep = flip ? -1 : 1;
+    int xs = (s_fdx > 0) ? GRID_W - 1 : 0;
+    int xstep = (s_fdx > 0) ? -1 : 1;
     for (int n = 0; n < GRID_W; n++) {
       int gx = xs + xstep * n;
       for (int m = 0; m < GRID_H; m++) {
-        int gy = ys + ystep * m;
-        update_grain(gx, gy, fdx, fdy, adx, ady, bdx, bdy);
+        int gy = flip ? (GRID_H - 1 - m) : m;
+        update_grain(gx, gy);
       }
     }
   }
