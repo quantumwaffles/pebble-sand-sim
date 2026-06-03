@@ -24,10 +24,11 @@
 #define BRUSH_MIN 1
 #define BRUSH_MAX 5
 
-// Grain color palettes selectable via the menu. Ember is special-cased in
-// cell_color to animate (glow) instead of using a static per-grain shade.
-#define NUM_PALETTES 7
+// Grain color palettes selectable via the menu. Ember and Gold are special-cased
+// in cell_color to animate (glow / glisten) instead of a static per-grain shade.
+#define NUM_PALETTES 8
 #define PALETTE_EMBER 6
+#define PALETTE_GOLD  7
 
 // Tilt gravity speed: the sand feels the in-plane projection of gravity (what's
 // left after the component pointing into the glass). Its magnitude sets how
@@ -152,6 +153,12 @@ static inline uint8_t cell_color(uint8_t m, int gx, int gy) {
       uint32_t a = (s_frame * 5u + (h & 0xFFu)) & 0xFFu;
       uint32_t tri = (a < 128u) ? (a * 2u) : ((255u - a) * 2u);  // 0..254
       idx = tri >> 6;                                            // 0..3
+    } else if (s_palette == PALETTE_GOLD) {
+      // Mostly a steady gold tone (0-2); each grain briefly flashes the bright
+      // highlight (3) on its own phase, so a sparse few glint at any moment.
+      uint32_t phase = (h >> 5) & 127u;
+      uint32_t t = (s_frame + phase) & 127u;
+      idx = (t < 3u) ? 3 : (int)(h % 3u);
     } else {
       idx = h & (NUM_SAND - 1);
     }
@@ -162,7 +169,7 @@ static inline uint8_t cell_color(uint8_t m, int gx, int gy) {
 
 // --- Color palettes ----------------------------------------------------------
 static const char *PALETTE_NAMES[NUM_PALETTES] = {
-  "Sand", "Ice", "Lime", "Berry", "Cherry", "Amber", "Ember"
+  "Sand", "Ice", "Lime", "Berry", "Cherry", "Amber", "Ember", "Gold"
 };
 
 // Fill the active sand shades from the chosen palette (4 shades each).
@@ -210,6 +217,12 @@ static void set_palette(int idx) {
       s_sand[1] = GColorFromRGB(0xAA, 0x00, 0x00).argb;
       s_sand[2] = GColorFromRGB(0xFF, 0x55, 0x00).argb;
       s_sand[3] = GColorFromRGB(0xFF, 0xAA, 0x00).argb;
+      break;
+    case 7:  // Gold (shades 0-2 are metallic tones; 3 is the glint highlight)
+      s_sand[0] = GColorFromRGB(0xAA, 0x55, 0x00).argb;
+      s_sand[1] = GColorFromRGB(0xFF, 0xAA, 0x00).argb;
+      s_sand[2] = GColorFromRGB(0xFF, 0xAA, 0x55).argb;
+      s_sand[3] = GColorFromRGB(0xFF, 0xFF, 0xAA).argb;
       break;
   }
 }
