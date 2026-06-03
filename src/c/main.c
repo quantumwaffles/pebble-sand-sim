@@ -24,8 +24,10 @@
 #define BRUSH_MIN 1
 #define BRUSH_MAX 5
 
-// Number of grain color palettes selectable via the menu.
-#define NUM_PALETTES 4
+// Grain color palettes selectable via the menu. Ember is special-cased in
+// cell_color to animate (glow) instead of using a static per-grain shade.
+#define NUM_PALETTES 7
+#define PALETTE_EMBER 6
 
 // Tilt gravity speed: the sand feels the in-plane projection of gravity (what's
 // left after the component pointing into the glass). Its magnitude sets how
@@ -96,6 +98,16 @@ static const GPathInfo ARROW_LEFT_INFO   = { 3, (GPoint[]) { {3, -6},  {3, 6},  
 static const GPathInfo ARROW_RIGHT_INFO  = { 3, (GPoint[]) { {-3, -6}, {-3, 6}, {4, 0}  } };
 static GPath *s_arrow_up, *s_arrow_down, *s_arrow_left, *s_arrow_right;
 
+// Level-transition slide animation: the label text slides horizontally while the
+// bar and arrows stay put. Driven by the frame timer. dir +1 descends (old label
+// exits left, new enters from right); -1 ascends (mirror).
+#define MENU_ANIM_FRAMES 7
+static bool s_anim_active = false;
+static int  s_anim_t = 0;
+static int  s_anim_dir = 0;
+static char s_anim_from[24];
+static char s_anim_to[24];
+
 // --- Tiny fast PRNG (xorshift32) --------------------------------------------
 static uint32_t s_rng = 0x1a2b3c4d;
 static inline uint32_t xrand(void) {
@@ -123,22 +135,35 @@ static inline bool in_bounds(int gx, int gy) {
   return gx >= 0 && gx < GRID_W && gy >= 0 && gy < GRID_H;
 }
 
-// Stable per-grain tint: hash the cell coordinate into the sand palette so a
-// settled grain keeps the same shade frame to frame. The integer finalizer
-// (xxHash-style) avalanches the bits so even the low bits we index with look
-// like random noise rather than regular diagonal bands.
+// Per-grain tint: hash the cell coordinate into the palette so a settled grain
+// keeps the same shade frame to frame. The integer finalizer (xxHash-style)
+// avalanches the bits so even the low bits we index with look like random noise
+// rather than regular diagonal bands. Ember is the exception: each grain's index
+// is animated along the dark->hot ramp on its own phase, so the bed glows.
 static inline uint8_t cell_color(uint8_t m, int gx, int gy) {
   if (m == MAT_SAND) {
     uint32_t h = (uint32_t)gx * 374761393u + (uint32_t)gy * 668265263u;
     h = (h ^ (h >> 13)) * 1274126177u;
     h ^= h >> 16;
-    return s_sand[h & (NUM_SAND - 1)];
+    int idx;
+    if (s_palette == PALETTE_EMBER) {
+      // Triangle wave over time, offset per grain by its hash, so grains drift
+      // up and down the 4-step ramp out of sync -> a shimmering ember glow.
+      uint32_t a = (s_frame * 5u + (h & 0xFFu)) & 0xFFu;
+      uint32_t tri = (a < 128u) ? (a * 2u) : ((255u - a) * 2u);  // 0..254
+      idx = tri >> 6;                                            // 0..3
+    } else {
+      idx = h & (NUM_SAND - 1);
+    }
+    return s_sand[idx];
   }
   return GColorWhite.argb;
 }
 
 // --- Color palettes ----------------------------------------------------------
-static const char *PALETTE_NAMES[NUM_PALETTES] = { "Sand", "Ice", "Lime", "Berry" };
+static const char *PALETTE_NAMES[NUM_PALETTES] = {
+  "Sand", "Ice", "Lime", "Berry", "Cherry", "Amber", "Ember"
+};
 
 // Fill the active sand shades from the chosen palette (4 shades each).
 static void set_palette(int idx) {
@@ -167,6 +192,24 @@ static void set_palette(int idx) {
       s_sand[1] = GColorFromRGB(0xFF, 0x77, 0xBB).argb;
       s_sand[2] = GColorFromRGB(0xCC, 0x55, 0xFF).argb;
       s_sand[3] = GColorFromRGB(0x99, 0x33, 0x88).argb;
+      break;
+    case 4:  // Cherry
+      s_sand[0] = GColorFromRGB(0xAA, 0x00, 0x00).argb;
+      s_sand[1] = GColorFromRGB(0xFF, 0x00, 0x00).argb;
+      s_sand[2] = GColorFromRGB(0xFF, 0x55, 0x55).argb;
+      s_sand[3] = GColorFromRGB(0xAA, 0x00, 0x55).argb;
+      break;
+    case 5:  // Amber
+      s_sand[0] = GColorFromRGB(0xFF, 0xAA, 0x00).argb;
+      s_sand[1] = GColorFromRGB(0xFF, 0x55, 0x00).argb;
+      s_sand[2] = GColorFromRGB(0xFF, 0xAA, 0x55).argb;
+      s_sand[3] = GColorFromRGB(0xAA, 0x55, 0x00).argb;
+      break;
+    case 6:  // Ember (dark -> hot ramp; cell_color animates the index)
+      s_sand[0] = GColorFromRGB(0x55, 0x00, 0x00).argb;
+      s_sand[1] = GColorFromRGB(0xAA, 0x00, 0x00).argb;
+      s_sand[2] = GColorFromRGB(0xFF, 0x55, 0x00).argb;
+      s_sand[3] = GColorFromRGB(0xFF, 0xAA, 0x00).argb;
       break;
   }
 }
@@ -327,6 +370,29 @@ static void sim_step(void) {
   }
 }
 
+// --- Menu helpers ------------------------------------------------------------
+// Format the label shown for a given menu level + category (values read live).
+static void menu_label_for(char *buf, size_t n, MenuState menu, int cat) {
+  if (menu == MENU_L1) {
+    snprintf(buf, n, "%s", CAT_NAMES[cat]);
+    return;
+  }
+  switch (cat) {
+    case CAT_COLOR:   snprintf(buf, n, "%s", PALETTE_NAMES[s_palette]); break;
+    case CAT_SIZE:    snprintf(buf, n, "%d", s_brush_r); break;
+    case CAT_GRAVITY: snprintf(buf, n, "%s", s_gravity_on ? "On" : "Off"); break;
+    case CAT_CLEAR:   snprintf(buf, n, "Confirm?"); break;
+    default:          buf[0] = '\0'; break;
+  }
+}
+
+// Draw a menu label centered in a full-width rect shifted by x_off (for slides).
+static void menu_draw_label(GContext *ctx, const char *text, int x_off, int by, int bh, int w) {
+  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  GRect tr = GRect(x_off, by + (bh - 26) / 2, w, 26);
+  graphics_draw_text(ctx, text, font, tr, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+}
+
 // --- Rendering ---------------------------------------------------------------
 // Clear to black, then write each filled cell's color block straight into the
 // captured 8-bit framebuffer (1 byte per pixel on Emery).
@@ -366,19 +432,46 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
     int cy = by + bh / 2;
     GRect bar = GRect(0, by, bounds.size.w, bh);
 
+    int w = bounds.size.w;
     graphics_context_set_fill_color(ctx, GColorBlack);
     graphics_fill_rect(ctx, bar, 0, GCornerNone);
     graphics_context_set_stroke_color(ctx, GColorWhite);
-    graphics_draw_line(ctx, GPoint(0, by), GPoint(bounds.size.w, by));
-    graphics_draw_line(ctx, GPoint(0, by + bh - 1), GPoint(bounds.size.w, by + bh - 1));
+    graphics_draw_line(ctx, GPoint(0, by), GPoint(w, by));
+    graphics_draw_line(ctx, GPoint(0, by + bh - 1), GPoint(w, by + bh - 1));
 
-    // Arrows. Left (Back) and right (Select) always apply; up/down only when
-    // the current level has options to cycle (everything but the Clear confirm).
+    // Label(s): one centered label normally; during a level transition, the old
+    // label slides out and the new one slides in (ease-out).
+    graphics_context_set_text_color(ctx, GColorWhite);
+    if (!s_anim_active) {
+      char buf[24];
+      menu_label_for(buf, sizeof(buf), s_menu, s_cat);
+      menu_draw_label(ctx, buf, 0, by, bh, w);
+    } else {
+      int q = MENU_ANIM_FRAMES - s_anim_t;            // frames remaining
+      int rem_w = q * q * w / (MENU_ANIM_FRAMES * MENU_ANIM_FRAMES);  // (1-eased)*w
+      int eased_w = w - rem_w;                         // eased*w
+      menu_draw_label(ctx, s_anim_from, -s_anim_dir * eased_w, by, bh, w);
+      menu_draw_label(ctx, s_anim_to,    s_anim_dir * rem_w,   by, bh, w);
+    }
+
+    // Arrows on top so they stay crisp over any sliding text. Left (Back) and
+    // right (Select) always apply; up/down only when there are options to cycle.
     graphics_context_set_fill_color(ctx, GColorWhite);
     gpath_move_to(s_arrow_left, GPoint(13, cy));
     gpath_draw_filled(ctx, s_arrow_left);
-    gpath_move_to(s_arrow_right, GPoint(bounds.size.w - 13, cy));
-    gpath_draw_filled(ctx, s_arrow_right);
+    if (s_menu == MENU_L1) {
+      // Right arrow: Select descends into the values.
+      gpath_move_to(s_arrow_right, GPoint(w - 13, cy));
+      gpath_draw_filled(ctx, s_arrow_right);
+    } else {
+      // Checkmark: at L2 Select confirms/closes (no deeper level).
+      int bx = w - 18;
+      graphics_context_set_stroke_color(ctx, GColorWhite);
+      graphics_context_set_stroke_width(ctx, 3);
+      graphics_draw_line(ctx, GPoint(bx, cy + 1), GPoint(bx + 4, cy + 5));
+      graphics_draw_line(ctx, GPoint(bx + 4, cy + 5), GPoint(bx + 11, cy - 5));
+      graphics_context_set_stroke_width(ctx, 1);
+    }
     bool cyclable = (s_menu == MENU_L1) || (s_cat != CAT_CLEAR);
     if (cyclable) {
       gpath_move_to(s_arrow_up, GPoint(cx, by + 12));
@@ -386,24 +479,6 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
       gpath_move_to(s_arrow_down, GPoint(cx, by + bh - 12));
       gpath_draw_filled(ctx, s_arrow_down);
     }
-
-    char buf[24];
-    if (s_menu == MENU_L1) {
-      snprintf(buf, sizeof(buf), "%s", CAT_NAMES[s_cat]);
-    } else {
-      switch (s_cat) {
-        case CAT_COLOR:   snprintf(buf, sizeof(buf), "Color: %s", PALETTE_NAMES[s_palette]); break;
-        case CAT_SIZE:    snprintf(buf, sizeof(buf), "Size: %d", s_brush_r); break;
-        case CAT_GRAVITY: snprintf(buf, sizeof(buf), "Gravity: %s", s_gravity_on ? "On" : "Off"); break;
-        case CAT_CLEAR:   snprintf(buf, sizeof(buf), "Clear?"); break;
-        default:          buf[0] = '\0'; break;
-      }
-    }
-
-    graphics_context_set_text_color(ctx, GColorWhite);
-    GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
-    GRect tr = GRect(26, by + (bh - 26) / 2, bounds.size.w - 52, 26);
-    graphics_draw_text(ctx, buf, font, tr, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
   }
 }
 
@@ -417,6 +492,9 @@ static void timer_cb(void *data) {
 #endif
   update_gravity();
   sim_step();
+  if (s_anim_active && ++s_anim_t >= MENU_ANIM_FRAMES) {
+    s_anim_active = false;
+  }
   s_frame++;
   layer_mark_dirty(s_canvas_layer);
   s_timer = app_timer_register(FRAME_MS, timer_cb, NULL);
@@ -451,6 +529,19 @@ static void clear_grid(void) {
   memset(s_grid, MAT_EMPTY, sizeof(s_grid));
 }
 
+// Start a horizontal slide between two menu labels. A MENU_CLOSED endpoint maps
+// to an empty label so opening slides the first label in (and nothing slides on
+// a plain open). dir +1 descends, -1 ascends.
+static void menu_slide(MenuState from_m, int from_c, MenuState to_m, int to_c, int dir) {
+  menu_label_for(s_anim_from, sizeof(s_anim_from), from_m, from_c);
+  menu_label_for(s_anim_to, sizeof(s_anim_to), to_m, to_c);
+  if (from_m == MENU_CLOSED) s_anim_from[0] = '\0';
+  if (to_m == MENU_CLOSED) s_anim_to[0] = '\0';
+  s_anim_dir = dir;
+  s_anim_t = 0;
+  s_anim_active = true;
+}
+
 // Change the focused category's value (dir is +1/-1) and apply it live.
 static void menu_adjust(int dir) {
   switch (s_cat) {
@@ -472,6 +563,7 @@ static void menu_adjust(int dir) {
 }
 
 static void up_click(ClickRecognizerRef recognizer, void *context) {
+  s_anim_active = false;  // cycling is instant; don't fight a level slide
   if (s_menu == MENU_L1) {
     s_cat = (s_cat - 1 + NUM_CATS) % NUM_CATS;
   } else if (s_menu == MENU_L2) {
@@ -480,6 +572,7 @@ static void up_click(ClickRecognizerRef recognizer, void *context) {
 }
 
 static void down_click(ClickRecognizerRef recognizer, void *context) {
+  s_anim_active = false;
   if (s_menu == MENU_L1) {
     s_cat = (s_cat + 1) % NUM_CATS;
   } else if (s_menu == MENU_L2) {
@@ -495,16 +588,19 @@ static void select_click(ClickRecognizerRef recognizer, void *context) {
 #if defined(PBL_TOUCH)
       s_touch_active = false;  // stop any in-progress painting as we open
 #endif
+      menu_slide(MENU_CLOSED, s_cat, MENU_L1, s_cat, +1);
       s_menu = MENU_L1;
       break;
     case MENU_L1:
+      menu_slide(MENU_L1, s_cat, MENU_L2, s_cat, +1);
       s_menu = MENU_L2;
       break;
     case MENU_L2:
       if (s_cat == CAT_CLEAR) {
         clear_grid();
       }
-      s_menu = MENU_CLOSED;
+      s_menu = MENU_CLOSED;  // closing is instant
+      s_anim_active = false;
       break;
   }
 }
@@ -513,10 +609,12 @@ static void select_click(ClickRecognizerRef recognizer, void *context) {
 static void back_click(ClickRecognizerRef recognizer, void *context) {
   switch (s_menu) {
     case MENU_L2:
+      menu_slide(MENU_L2, s_cat, MENU_L1, s_cat, -1);
       s_menu = MENU_L1;
       break;
     case MENU_L1:
-      s_menu = MENU_CLOSED;
+      s_menu = MENU_CLOSED;  // closing is instant
+      s_anim_active = false;
       break;
     case MENU_CLOSED:
       window_stack_pop(true);  // exit the app, as Back normally would
