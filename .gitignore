@@ -1,0 +1,6 @@
+build/
+node_modules/
+.pebble-ip
+pebble_screenshot_*.png
+.lock-waf_linux2_build
+.lock-waf_linux_build

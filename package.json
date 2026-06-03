@@ -1,0 +1,33 @@
+{
+    "author": "Michael Rex",
+    "dependencies": {},
+    "keywords": [],
+    "description": "A falling-sand simulation game for Pebble.",
+    "name": "pebble-sand-sim",
+    "pebble": {
+        "capabilities": [],
+        "displayName": "Sand Sim",
+        "enableMultiJS": true,
+        "messageKeys": [],
+        "projectType": "native",
+        "resources": {
+            "media": [
+                {
+                    "type": "bitmap",
+                    "name": "IMAGE_MENU_ICON",
+                    "file": "images/menu_icon.png",
+                    "menuIcon": true
+                }
+            ]
+        },
+        "sdkVersion": "3",
+        "targetPlatforms": [
+            "emery"
+        ],
+        "uuid": "c4c5c585-b762-41f9-ace6-2a04aeefd7db",
+        "watchapp": {
+            "watchface": false
+        }
+    },
+    "version": "0.1.0"
+}
