@@ -39,8 +39,9 @@ typedef enum { BEH_POWDER, BEH_LIQUID, BEH_SOLID } Behavior;
 #define VIS_GOLD   7
 #define VIS_SLATE  8
 
-// A material is a (behavior, visual) preset with a display name.
-typedef struct { uint8_t behavior; uint8_t visual; const char *name; } Material;
+// A material is a (behavior, visual) preset with a display name (auto-generated
+// for created/edited ones, so no on-watch text entry).
+typedef struct { uint8_t behavior; uint8_t visual; char name[20]; } Material;
 #define MAX_MATERIALS 16
 
 // Paint brush radius range, in cells (selectable via the menu).
@@ -135,6 +136,33 @@ static Material s_materials[MAX_MATERIALS] = {
   { BEH_LIQUID, VIS_EMBER, "Lava"  },  // 4
 };
 static int s_material_count = 4;       // valid material indices are 1..4
+#define NUM_DEFAULT_MATS 4             // 1..4 are built-in (no edit/delete)
+
+// Names for the two axes (used to auto-name materials and in the edit menus).
+static const char *BEH_NAMES[3] = { "Powder", "Liquid", "Solid" };
+static const char *VIS_NAMES[NUM_VISUALS] = {
+  "Sand", "Ice", "Lime", "Berry", "Cherry", "Amber", "Ember", "Gold", "Slate"
+};
+
+static int s_edit_mat = 1;             // material being edited in the menu
+static bool s_mat_is_new = false;      // editing an unsaved draft (Custom)
+
+// Name a material "<Behavior> <Visual>".
+static void material_autoname(int i) {
+  snprintf(s_materials[i].name, sizeof(s_materials[i].name), "%s %s",
+           BEH_NAMES[s_materials[i].behavior], VIS_NAMES[s_materials[i].visual]);
+}
+
+// Set up a draft material (default Powder+Sand) in the slot just past the table,
+// without counting it yet; returns its index. Committed by NODE_MATEDIT's "Add".
+static int material_draft(void) {
+  int i = s_material_count + 1;
+  if (i >= MAX_MATERIALS) i = s_material_count;  // full: reuse last (no room)
+  s_materials[i].behavior = BEH_POWDER;
+  s_materials[i].visual = VIS_SAND;
+  material_autoname(i);
+  return i;
+}
 
 // Tools: how the finger interacts with the canvas. Brush paints the selected
 // material; Eraser removes; Attract/Repel bend gravity locally (sink / source).
@@ -166,7 +194,12 @@ static bool s_bounds_on = true;       // false lets material flow off-screen
 // nav stack of (node, selected index) tracks the path so Back can restore it.
 typedef enum {
   NODE_ROOT, NODE_MATERIAL, NODE_TOOL, NODE_SIZE,
-  NODE_GRAVITY, NODE_GRAVDIR, NODE_BOUNDS, NODE_CLEAR
+  NODE_GRAVITY, NODE_GRAVDIR, NODE_BOUNDS, NODE_CLEAR,
+  NODE_MATITEM,    // per-material actions: Use / Edit / Delete
+  NODE_MATEDIT,    // edit axes: Behavior / Visual [/ Add, when new]
+  NODE_BEHAVIOR,   // pick a behavior (leaf)
+  NODE_VISUAL,     // pick a visual (leaf)
+  NODE_DELCONFIRM  // confirm material delete
 } MenuNode;
 
 // Root items (also the category names).
@@ -181,7 +214,7 @@ static const char *CAT_NAMES[NUM_CATS] = {
 static const char *DIR_NAMES[4] = { "Down", "Up", "Left", "Right" };
 static int s_static_dir = 0;          // committed Static direction (default Down)
 
-#define MENU_MAX_DEPTH 4
+#define MENU_MAX_DEPTH 6
 static int s_nav_node[MENU_MAX_DEPTH];
 static int s_nav_sel[MENU_MAX_DEPTH];
 static int s_nav_depth = 0;           // 0 = closed; current level = depth - 1
@@ -568,18 +601,36 @@ static void sim_step(void) {
   }
 }
 
+// Delete a (custom) material: erase its grains, shift the table down, and fix up
+// indices in the grid and the brush selection.
+static void material_delete(int idx) {
+  for (int i = 0; i < GRID_W * GRID_H; i++) {
+    if (s_grid[i] == idx) s_grid[i] = MAT_EMPTY;
+    else if (s_grid[i] > idx) s_grid[i]--;
+  }
+  for (int i = idx; i < s_material_count; i++) s_materials[i] = s_materials[i + 1];
+  s_material_count--;
+  if (s_brush_mat == idx) s_brush_mat = 1;
+  else if (s_brush_mat > idx) s_brush_mat--;
+}
+
 // --- Menu helpers ------------------------------------------------------------
 // Number of items in a node.
 static int node_count(int node) {
   switch (node) {
     case NODE_ROOT:     return NUM_CATS;
-    case NODE_MATERIAL: return s_material_count;
+    case NODE_MATERIAL: return s_material_count + 1;  // materials + "Add"
     case NODE_TOOL:     return NUM_TOOLS;
     case NODE_SIZE:     return BRUSH_MAX - BRUSH_MIN + 1;
     case NODE_GRAVITY:  return NUM_GMODES;
     case NODE_GRAVDIR:  return 4;
     case NODE_BOUNDS:   return 2;
     case NODE_CLEAR:    return 1;
+    case NODE_MATITEM:  return (s_edit_mat <= NUM_DEFAULT_MATS) ? 1 : 3;  // Use [/ Edit / Delete]
+    case NODE_MATEDIT:  return s_mat_is_new ? 3 : 2;  // Behavior / Visual [/ Add]
+    case NODE_BEHAVIOR: return 3;
+    case NODE_VISUAL:   return NUM_VISUALS;
+    case NODE_DELCONFIRM: return 1;
   }
   return 1;
 }
@@ -588,13 +639,21 @@ static int node_count(int node) {
 static void node_label(int node, int sel, char *buf, size_t n) {
   switch (node) {
     case NODE_ROOT:     snprintf(buf, n, "%s", CAT_NAMES[sel]); break;
-    case NODE_MATERIAL: snprintf(buf, n, "%s", s_materials[sel + 1].name); break;
+    case NODE_MATERIAL:
+      if (sel < s_material_count) snprintf(buf, n, "%s", s_materials[sel + 1].name);
+      else snprintf(buf, n, "Custom");
+      break;
     case NODE_TOOL:     snprintf(buf, n, "%s", TOOL_NAMES[sel]); break;
     case NODE_SIZE:     snprintf(buf, n, "%d", BRUSH_MIN + sel); break;
     case NODE_GRAVITY:  snprintf(buf, n, "%s", GMODE_NAMES[sel]); break;
     case NODE_GRAVDIR:  snprintf(buf, n, "%s", DIR_NAMES[sel]); break;
     case NODE_BOUNDS:   snprintf(buf, n, "%s", sel ? "On" : "Off"); break;
     case NODE_CLEAR:    snprintf(buf, n, "Confirm?"); break;
+    case NODE_MATITEM:  snprintf(buf, n, "%s", sel == 0 ? "Use" : (sel == 1 ? "Edit" : "Delete")); break;
+    case NODE_MATEDIT:  snprintf(buf, n, "%s", sel == 0 ? "Behavior" : (sel == 1 ? "Visual" : "Add")); break;
+    case NODE_BEHAVIOR: snprintf(buf, n, "%s", BEH_NAMES[sel]); break;
+    case NODE_VISUAL:   snprintf(buf, n, "%s", VIS_NAMES[sel]); break;
+    case NODE_DELCONFIRM: snprintf(buf, n, "Delete?"); break;
     default:            buf[0] = '\0'; break;
   }
 }
@@ -603,6 +662,9 @@ static void node_label(int node, int sel, char *buf, size_t n) {
 static bool node_item_descends(int node, int sel) {
   if (node == NODE_ROOT) return true;
   if (node == NODE_GRAVITY && sel == GMODE_STATIC) return true;
+  if (node == NODE_MATERIAL) return true;        // pick material or Custom -> descend
+  if (node == NODE_MATITEM) return sel != 0;     // Edit/Delete descend; Use commits
+  if (node == NODE_MATEDIT) return sel < 2;      // Behavior/Visual descend; Add commits
   return false;
 }
 
@@ -611,13 +673,18 @@ static bool node_item_descends(int node, int sel) {
 static int node_init_sel(int node) {
   switch (node) {
     case NODE_ROOT:     return s_root_sel;
-    case NODE_MATERIAL: return s_brush_mat - 1;
+    case NODE_MATERIAL: return 0;
     case NODE_TOOL:     return s_tool;
     case NODE_SIZE:     return s_brush_r - BRUSH_MIN;
     case NODE_GRAVITY:  return s_gravity_mode;
     case NODE_GRAVDIR:  return s_static_dir;
     case NODE_BOUNDS:   return s_bounds_on;
     case NODE_CLEAR:    return 0;
+    case NODE_MATITEM:  return 0;
+    case NODE_MATEDIT:  return 0;
+    case NODE_BEHAVIOR: return s_materials[s_edit_mat].behavior;
+    case NODE_VISUAL:   return s_materials[s_edit_mat].visual;
+    case NODE_DELCONFIRM: return 0;
   }
   return 0;
 }
@@ -801,19 +868,39 @@ static int node_child(int node, int sel) {
     }
   }
   if (node == NODE_GRAVITY && sel == GMODE_STATIC) return NODE_GRAVDIR;
+  if (node == NODE_MATERIAL) {
+    if (sel < s_material_count) { s_edit_mat = sel + 1; return NODE_MATITEM; }
+    s_edit_mat = material_draft();   // "Custom" -> edit an unsaved draft
+    s_mat_is_new = true;
+    return NODE_MATEDIT;
+  }
+  if (node == NODE_MATITEM) {
+    if (sel == 1) { s_mat_is_new = false; return NODE_MATEDIT; }  // Edit existing
+    return NODE_DELCONFIRM;                                       // Delete
+  }
+  if (node == NODE_MATEDIT) return (sel == 0) ? NODE_BEHAVIOR : NODE_VISUAL;
   return NODE_ROOT;
 }
 
 // Commit a leaf node's selected value (or run its action).
 static void node_commit(int node, int sel) {
   switch (node) {
-    case NODE_MATERIAL: s_brush_mat = sel + 1; break;
     case NODE_TOOL:     s_tool = sel; break;
     case NODE_SIZE:     s_brush_r = BRUSH_MIN + sel; break;
     case NODE_GRAVITY:  s_gravity_mode = sel; break;  // Static descends, not here
     case NODE_GRAVDIR:  s_gravity_mode = GMODE_STATIC; s_static_dir = sel; break;
     case NODE_BOUNDS:   s_bounds_on = sel; break;
     case NODE_CLEAR:    clear_grid(); break;
+    case NODE_MATITEM:  if (sel == 0) s_brush_mat = s_edit_mat; break;  // Use
+    case NODE_MATEDIT:  // "Add": save the draft, select it, close
+      s_material_count = s_edit_mat;
+      s_brush_mat = s_edit_mat;
+      break;
+    case NODE_BEHAVIOR: s_materials[s_edit_mat].behavior = sel;
+                        material_autoname(s_edit_mat); break;
+    case NODE_VISUAL:   s_materials[s_edit_mat].visual = sel;
+                        material_autoname(s_edit_mat); break;
+    case NODE_DELCONFIRM: material_delete(s_edit_mat); break;
     default: break;
   }
 }
@@ -856,9 +943,16 @@ static void select_click(ClickRecognizerRef recognizer, void *context) {
     }
   } else {
     node_commit(node, sel);
-    s_root_sel = s_nav_sel[0];  // remember the category for next open
-    s_nav_depth = 0;            // close (instant)
-    s_anim_active = false;
+    // Editing an axis (Behavior/Visual) applies live and stays in the editor;
+    // everything else (Use / Add / Delete confirm) closes to the canvas.
+    if (node == NODE_BEHAVIOR || node == NODE_VISUAL) {
+      menu_slide(node, sel, s_nav_node[d - 1], s_nav_sel[d - 1], -1);
+      s_nav_depth--;
+    } else {
+      s_root_sel = s_nav_sel[0];  // remember the category for next open
+      s_nav_depth = 0;            // close (instant)
+      s_anim_active = false;
+    }
   }
 }
 
