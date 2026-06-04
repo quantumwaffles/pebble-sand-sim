@@ -1,10 +1,12 @@
 # Pebble Sand Sim
 
-A falling-sand sandbox for the **Pebble Time 2 (Emery)** — color display and
-capacitive touch. Paint powders, liquids, and walls; tilt the watch to pour
-them; bend gravity with your finger; build your own materials. Everything is a
-fixed-point cellular automaton tuned to run at ~30 fps inside the watch's RAM
-and CPU budget.
+A falling-sand cellular-automaton simulation for the **Pebble Time 2 (Emery)**
+smartwatch (64-color display, capacitive touchscreen). Each grid cell holds a
+material with one of three physical behaviors — powder, liquid, or solid. The
+accelerometer drives gravity, the touchscreen paints material or applies
+force-field tools, and materials can be defined and edited at runtime. The
+simulation uses fixed-point integer math and renders at ~30 fps within the
+watch's RAM and CPU limits.
 
 The entire app is a single file: [`src/c/main.c`](src/c/main.c).
 
