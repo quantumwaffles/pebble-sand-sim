@@ -68,6 +68,18 @@ typedef struct { uint8_t behavior; uint8_t visual; char name[20]; } Material;
 // --- Timing ------------------------------------------------------------------
 #define FRAME_MS 33                // ~30 fps
 
+// --- Persistence -------------------------------------------------------------
+// Persist fields cap at 256 bytes, so the grid (4 bits/cell) is chunked.
+#define PERSIST_FORMAT  1          // bump to invalidate old saves
+#define PKEY_FORMAT     1
+#define PKEY_MATERIALS  2
+#define PKEY_SETTINGS   3
+#define PKEY_GRID       100        // grid chunks at 100, 101, ...
+#define PERSIST_CHUNK   256
+#define GRID_CELLS      (GRID_W * GRID_H)
+#define GRID_PACK_BYTES ((GRID_CELLS + 1) / 2)
+#define GRID_CHUNKS     ((GRID_PACK_BYTES + PERSIST_CHUNK - 1) / PERSIST_CHUNK)
+
 static Window *s_window;
 static Layer *s_canvas_layer;
 static AppTimer *s_timer;
@@ -1017,8 +1029,92 @@ static void accel_handler(AccelData *data, uint32_t num_samples) {
   s_accel_y = last.y;
 }
 
+// --- Persistence -------------------------------------------------------------
+// Save custom materials, settings, and the canvas to persistent storage.
+static void save_state(void) {
+  persist_write_int(PKEY_FORMAT, PERSIST_FORMAT);
+
+  // Custom materials only (defaults keep their static names): count + (beh,vis).
+  uint8_t mbuf[1 + 2 * MAX_MATERIALS];
+  int p = 0;
+  mbuf[p++] = s_material_count;
+  for (int i = NUM_DEFAULT_MATS + 1; i <= s_material_count; i++) {
+    mbuf[p++] = s_materials[i].behavior;
+    mbuf[p++] = s_materials[i].visual;
+  }
+  persist_write_data(PKEY_MATERIALS, mbuf, p);
+
+  uint8_t sbuf[6] = {
+    (uint8_t)s_brush_mat, (uint8_t)s_tool, (uint8_t)s_brush_r,
+    (uint8_t)s_gravity_mode, (uint8_t)s_static_dir, (uint8_t)s_bounds_on
+  };
+  persist_write_data(PKEY_SETTINGS, sbuf, sizeof(sbuf));
+
+  // Grid: pack 2 cells per byte (material indices are <= 15), then chunk it.
+  static uint8_t pack[GRID_PACK_BYTES];
+  for (int i = 0; i < GRID_CELLS; i += 2) {
+    uint8_t hi = (i + 1 < GRID_CELLS) ? (s_grid[i + 1] & 0x0F) : 0;
+    pack[i / 2] = (s_grid[i] & 0x0F) | (hi << 4);
+  }
+  for (int c = 0; c < GRID_CHUNKS; c++) {
+    int off = c * PERSIST_CHUNK;
+    int len = GRID_PACK_BYTES - off;
+    if (len > PERSIST_CHUNK) len = PERSIST_CHUNK;
+    persist_write_data(PKEY_GRID + c, &pack[off], len);
+  }
+}
+
+static void load_state(void) {
+  if (!persist_exists(PKEY_FORMAT) || persist_read_int(PKEY_FORMAT) != PERSIST_FORMAT) {
+    return;  // nothing saved (or old format) -> keep defaults
+  }
+
+  if (persist_exists(PKEY_MATERIALS)) {
+    uint8_t mbuf[1 + 2 * MAX_MATERIALS];
+    int n = persist_read_data(PKEY_MATERIALS, mbuf, sizeof(mbuf));
+    if (n >= 1) {
+      int count = clamp_i(mbuf[0], NUM_DEFAULT_MATS, MAX_MATERIALS - 1);
+      s_material_count = count;
+      int p = 1;
+      for (int i = NUM_DEFAULT_MATS + 1; i <= count && p + 1 < n; i++) {
+        s_materials[i].behavior = clamp_i(mbuf[p++], 0, 2);
+        s_materials[i].visual = clamp_i(mbuf[p++], 0, NUM_VISUALS - 1);
+        material_autoname(i);
+      }
+    }
+  }
+
+  uint8_t sbuf[6];
+  if (persist_read_data(PKEY_SETTINGS, sbuf, sizeof(sbuf)) == (int)sizeof(sbuf)) {
+    s_brush_mat     = clamp_i(sbuf[0], 1, s_material_count);
+    s_tool          = clamp_i(sbuf[1], 0, NUM_TOOLS - 1);
+    s_brush_r       = clamp_i(sbuf[2], BRUSH_MIN, BRUSH_MAX);
+    s_gravity_mode  = clamp_i(sbuf[3], 0, NUM_GMODES - 1);
+    s_static_dir    = clamp_i(sbuf[4], 0, 3);
+    s_bounds_on     = sbuf[5] ? true : false;
+  }
+
+  static uint8_t pack[GRID_PACK_BYTES];
+  bool ok = true;
+  for (int c = 0; c < GRID_CHUNKS; c++) {
+    int off = c * PERSIST_CHUNK;
+    int len = GRID_PACK_BYTES - off;
+    if (len > PERSIST_CHUNK) len = PERSIST_CHUNK;
+    if (persist_read_data(PKEY_GRID + c, &pack[off], len) != len) { ok = false; break; }
+  }
+  if (ok) {
+    for (int i = 0; i < GRID_CELLS; i += 2) {
+      uint8_t b = pack[i / 2];
+      uint8_t lo = b & 0x0F, hi = (b >> 4) & 0x0F;
+      s_grid[i] = (lo <= s_material_count) ? lo : MAT_EMPTY;  // drop stale indices
+      if (i + 1 < GRID_CELLS) s_grid[i + 1] = (hi <= s_material_count) ? hi : MAT_EMPTY;
+    }
+  }
+}
+
 static void init(void) {
   build_visuals();
+  load_state();
 
   // Continuously sample the accelerometer for low-latency tilt response. The
   // handler keeps the latest reading; update_gravity reads it each frame.
@@ -1045,6 +1141,7 @@ static void init(void) {
 }
 
 static void deinit(void) {
+  save_state();
   if (s_timer) {
     app_timer_cancel(s_timer);
   }
