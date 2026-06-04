@@ -891,10 +891,13 @@ static void node_commit(int node, int sel) {
     case NODE_GRAVDIR:  s_gravity_mode = GMODE_STATIC; s_static_dir = sel; break;
     case NODE_BOUNDS:   s_bounds_on = sel; break;
     case NODE_CLEAR:    clear_grid(); break;
-    case NODE_MATITEM:  if (sel == 0) s_brush_mat = s_edit_mat; break;  // Use
-    case NODE_MATEDIT:  // "Add": save the draft, select it, close
+    case NODE_MATITEM:  // Use: select material + switch to Brush
+      if (sel == 0) { s_brush_mat = s_edit_mat; s_tool = TOOL_BRUSH; }
+      break;
+    case NODE_MATEDIT:  // "Add": save the draft, select it (Brush), close
       s_material_count = s_edit_mat;
       s_brush_mat = s_edit_mat;
+      s_tool = TOOL_BRUSH;
       break;
     case NODE_BEHAVIOR: s_materials[s_edit_mat].behavior = sel;
                         material_autoname(s_edit_mat); break;
