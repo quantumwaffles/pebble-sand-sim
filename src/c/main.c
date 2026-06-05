@@ -250,6 +250,13 @@ static int  s_anim_dir = 0;
 static char s_anim_from[24];
 static char s_anim_to[24];
 
+// Canvas HUD: brief banners flashed by Up (tool, top) and Down (material,
+// bottom). First press shows the current value; pressing again while the banner
+// is still up cycles to the next.
+#define HUD_FRAMES 30
+static int s_hud_tool_t = 0;
+static int s_hud_mat_t = 0;
+
 // --- Tiny fast PRNG (xorshift32) --------------------------------------------
 static uint32_t s_rng = 0x1a2b3c4d;
 static inline uint32_t xrand(void) {
@@ -796,6 +803,26 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
       gpath_move_to(s_arrow_down, GPoint(cx, by + bh - 12));
       gpath_draw_filled(ctx, s_arrow_down);
     }
+  } else {
+    // Transient HUD banners: tool at the top, material at the bottom.
+    int w = bounds.size.w;
+    const int hh = 30;
+    graphics_context_set_text_color(ctx, GColorWhite);
+    if (s_hud_tool_t > 0) {
+      graphics_context_set_fill_color(ctx, GColorBlack);
+      graphics_fill_rect(ctx, GRect(0, 0, w, hh), 0, GCornerNone);
+      graphics_context_set_stroke_color(ctx, GColorWhite);
+      graphics_draw_line(ctx, GPoint(0, hh - 1), GPoint(w, hh - 1));
+      menu_draw_label(ctx, TOOL_NAMES[s_tool], 0, 0, hh, w);
+    }
+    if (s_hud_mat_t > 0) {
+      int hy = bounds.size.h - hh;
+      graphics_context_set_fill_color(ctx, GColorBlack);
+      graphics_fill_rect(ctx, GRect(0, hy, w, hh), 0, GCornerNone);
+      graphics_context_set_stroke_color(ctx, GColorWhite);
+      graphics_draw_line(ctx, GPoint(0, hy), GPoint(w, hy));
+      menu_draw_label(ctx, s_materials[s_brush_mat].name, 0, hy, hh, w);
+    }
   }
 }
 
@@ -812,6 +839,8 @@ static void timer_cb(void *data) {
   if (s_anim_active && ++s_anim_t >= MENU_ANIM_FRAMES) {
     s_anim_active = false;
   }
+  if (s_hud_tool_t > 0) s_hud_tool_t--;
+  if (s_hud_mat_t > 0) s_hud_mat_t--;
   s_frame++;
   layer_mark_dirty(s_canvas_layer);
   s_timer = app_timer_register(FRAME_MS, timer_cb, NULL);
@@ -928,8 +957,27 @@ static void nav_cycle(int dir) {
   s_nav_sel[d] = (s_nav_sel[d] + dir + c) % c;
 }
 
-static void up_click(ClickRecognizerRef recognizer, void *context) { nav_cycle(-1); }
-static void down_click(ClickRecognizerRef recognizer, void *context) { nav_cycle(+1); }
+// On the canvas, Up flashes/cycles the tool (top banner) and Down the brush
+// material (bottom banner): the first press just shows the current value; a press
+// while the banner is still up advances to the next. In the menu, they cycle.
+static void up_click(ClickRecognizerRef recognizer, void *context) {
+  if (s_nav_depth == 0) {
+    if (s_hud_tool_t > 0) s_tool = (s_tool + 1) % NUM_TOOLS;  // already showing -> cycle
+    s_hud_tool_t = HUD_FRAMES;
+    return;
+  }
+  nav_cycle(-1);
+}
+
+static void down_click(ClickRecognizerRef recognizer, void *context) {
+  if (s_nav_depth == 0) {
+    if (s_hud_mat_t > 0) s_brush_mat = s_brush_mat % s_material_count + 1;  // wrap 1..count
+    s_tool = TOOL_BRUSH;  // picking a material implies painting it
+    s_hud_mat_t = HUD_FRAMES;
+    return;
+  }
+  nav_cycle(+1);
+}
 
 // Select: open the menu from the canvas, descend into a child node, or commit a
 // leaf value (closing the menu).
